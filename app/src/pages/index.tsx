@@ -53,6 +53,7 @@ export default function Home() {
   const [serverUrl, setServerUrl] = useState<string>(DEFAULT_SERVER)
   const [password, setPassword] = useState<string>("")
   const [rooms, setRooms] = useState<RoomListItem[]>([])
+  const [roomsLoaded, setRoomsLoaded] = useState(false)
   const passwordRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -70,12 +71,14 @@ export default function Home() {
       const base = serverUrl.trim().replace(/\/+$/, "")
       if (!base) {
         setRooms([])
+        setRoomsLoaded(true)
         return
       }
       try {
         const resp = await fetch(`${base}/api/rooms`)
         if (!resp.ok) {
           setRooms([])
+          setRoomsLoaded(true)
           return
         }
         const data = (await resp.json()) as { rooms?: RoomListItem[] }
@@ -83,6 +86,7 @@ export default function Home() {
       } catch {
         setRooms([])
       }
+      setRoomsLoaded(true)
     }
     fetchRooms()
     timer = setInterval(fetchRooms, 15000)
@@ -230,29 +234,35 @@ export default function Home() {
           分享链接给朋友：{serverUrl}/room?id=房间号
         </p>
 
-        {rooms.length > 0 && (
+        {roomsLoaded && (
           <div className="mt-6 border-t border-gray-800 pt-4">
             <p className="mb-2 text-sm text-gray-300">
               活跃房间 <span className="text-gray-500">（点击直接加入）</span>
             </p>
-            <div className="max-h-48 space-y-2 overflow-y-auto">
-              {rooms.map((r) => (
-                <button
-                  key={r.room}
-                  onClick={() => joinFromList(r)}
-                  type="button"
-                  className="flex w-full items-center justify-between rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-left transition hover:border-gray-600"
-                >
-                  <span className="truncate text-sm text-white">
-                    {r.hasPassword ? "🔒 " : ""}
-                    {r.room}
-                  </span>
-                  <span className="ml-2 shrink-0 text-xs text-gray-500">
-                    {r.participants} 人在线
-                  </span>
-                </button>
-              ))}
-            </div>
+            {rooms.length > 0 ? (
+              <div className="max-h-48 space-y-2 overflow-y-auto">
+                {rooms.map((r) => (
+                  <button
+                    key={r.room}
+                    onClick={() => joinFromList(r)}
+                    type="button"
+                    className="flex w-full items-center justify-between rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-left transition hover:border-gray-600"
+                  >
+                    <span className="truncate text-sm text-white">
+                      {r.hasPassword ? "🔒 " : ""}
+                      {r.room}
+                    </span>
+                    <span className="ml-2 shrink-0 text-xs text-gray-500">
+                      {r.participants} 人在线
+                    </span>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-gray-500">
+                暂无活跃房间，快来创建第一个吧
+              </p>
+            )}
           </div>
         )}
       </div>
