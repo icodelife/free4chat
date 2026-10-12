@@ -1,5 +1,0 @@
-# Built binaries
-/free4chat-agent
-
-# Native distribution artifacts (built by scripts/release.sh)
-/dist

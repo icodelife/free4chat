@@ -1,250 +1,88 @@
-# free4chat
+# free4chat 中文精简版
 
-[www.free4.chat](https://www.free4.chat/) is an experimental system for **temporary capability access and collaboration**.
+基于 [free4chat](https://github.com/xwfounder/free4chat) 的 fork，专为中文用户精简：**只保留语音聊天和文字聊天**，移除 Agent、MCP、实时转写、TTS 等高级功能。
 
-Open a temporary Room, bring Humans and independently running Agents together,
-exchange realtime context, media, focused Tasks, artifacts, and results, then
-let the Room disappear when the work is done. No account or permanent
-workspace is required.
+## 特性
 
-> ⚠️ **Personal technical/product testbed. Use at your own risk.**
->
-> Free4Chat is intentionally still exploring its product shape. The stable idea
-> is low-friction temporary interaction between independently owned participants
-> and capabilities.
+- 🎙️ **语音聊天**：基于 Cloudflare Realtime SFU，WebRTC 低延迟
+- 💬 **文字聊天**：WebSocket 实时消息
+- 🔗 **URL 房间**：分享链接 `/room?id=xxx` 即可进房，无需注册
+- 🌐 **联邦模式**：默认放开 Origin 限制，任何客户端可连接任何服务端
+- 🚦 **房间限流**：每房间最多 10 人，满员时返回 429
+- 🇨🇳 **中文界面**：全部 UI 已汉化
 
-## What stays stable
+## 架构
 
-- **Temporary by default.** A Room is a short-lived access/collaboration
-  boundary, not a project or permanent workspace.
-- **Participant-owned capability.** Humans and Agents keep their intelligence,
-  tools, credentials, private memory, and durable state.
-- **Low friction.** A link or Room id should be enough to start; accounts and
-  organizations are not prerequisites.
-- **Thin core.** Free4Chat connects participants and bounded shared context
-  instead of becoming a central Agent platform, memory system, credential
-  vault, or workflow engine.
-- **Progressive collaboration.** Human↔Human, Human↔Agent, and Agent↔Agent are
-  all valid, but multiple Agents are not a goal by themselves.
-- **Cost-aware realtime.** Client/participant compute is preferred; high
-  frequency data should stay on the realtime data plane rather than becoming
-  persistent control-plane state.
-
-## What a Room is
-
-A Room is a short-lived **trust/access/collaboration boundary**. Humans join
-from a browser; Agents join from wherever they already run — laptop, Mac mini,
-VPS, container — through direct MCP or the local Agent Runtime.
-
-```text
-Temporary Room
-├── Humans
-└── independently running Agents
-
-Free4Chat owns:
-temporary rendezvous / presence / addressing
-bounded shared context / Task correlation / artifacts
-media / transport / Room-scoped grants
-
-Participants own:
-model / intelligence / tools / credentials
-permissions / private memory / durable state
+```
+浏览器 ←→ Worker (Next.js 前端 + API 代理) ←→ Cloudflare Realtime SFU
+                ↓
+         Durable Object (RoomSession)
+         - 成员管理、文字消息、语音元数据
 ```
 
-Human voice/text chat remains first-class. Agents are peer participants when
-their independently owned capabilities are useful.
+**Cloudflare 资源**（全部免费额度内）：
+- Worker：前端 + `/api/sfu/*` 代理 + 房间接口
+- Durable Object：`RoomSession`（绑定名 `SFU_ROOM`）
+- Realtime SFU App：语音媒体传输
+- 环境变量：`SFU_APP_ID`、`SFU_APP_SECRET`、`DISABLE_ORIGIN_CHECK=true`
 
-## Current shipped capabilities
+**未使用**：KV、D1、R2、TURN（只用 STUN）
 
-- 🎙️ Human voice chat
-- 💬 Text chat with emoji
-- 📎 File & image transfer with inline preview
-- 🖥️ Screen sharing
-- 🤖 Agent participants over the stateless MCP Room API
-- 🧩 Optional self-contained Go Agent Runtime for resident Harness presence
-- 📝 Room-wide Live Transcript from one Human-authorized STT-ready Runtime Host
-- 🧱 Bounded Room artifacts and structured request/result handoffs
-- 🎯 Focused Agent Tasks with isolated retained cognition scopes
-- 📦 Task-scoped Agent artifacts
-- ✅ Room-native ACP Human approval when the Harness requests permission
-- 🪟 Optional bounded Task Live View for small interactive Task interfaces
-- 🔒 No accounts, permanent workspace, or permanent Room history
-- ⏱️ Rooms expire after they have been empty for a while
+## 快速部署
 
-### Tasks and Live Views
+### 方式一：一键脚本（推荐）
 
-Ordinary Room conversation remains general shared context. A Task gives one
-Agent a focused temporary work scope with its own conversation/activity,
-artifacts, approvals, and optional one current Live View.
+```bash
+# 1. 在 Cloudflare 后台创建一个 API Token
+#    权限：Workers Scripts → Edit，Calls → Edit（均为账号权限）
 
-Task Live View is intentionally small and safe:
-
-```text
-Agent
-→ bounded declarative UI
-→ Free4Chat validates/renders it
-→ deterministic Button/Input interaction can stay browser-local
+# 2. 运行
+export CLOUDFLARE_API_TOKEN="你的token"
+export CLOUDFLARE_ACCOUNT_ID="你的账号ID"
+./one-click-deploy.sh
 ```
 
-It is not arbitrary Agent HTML/JavaScript and not a generic application
-runtime. See [Tasks and Live Views](https://www.free4.chat/docs/guides/tasks-and-live-views).
+脚本自动完成：创建 SFU App → 安装依赖 → 构建 → 部署 Worker → 设置密钥 → 开启 workers.dev。
 
-## Current product exploration
+### 方式二：GitHub Actions
 
-The shipped collaboration/Task substrate is stable enough to use as a product
-discovery vehicle.
+1. Fork 本仓库
+2. 在 Settings → Secrets → Actions 添加：
+   - `CLOUDFLARE_API_TOKEN`
+   - `CLOUDFLARE_ACCOUNT_ID`
+3. Actions → One-Click Deploy → Run workflow → `fresh_install=true`
+4. 跑完后把日志里的 `SFU_APP_ID` 也加到 Secrets（供增量部署用）
 
-The current evidence-gated technical experiment is
-[#344 — sandboxed Room Apps](../../issues/344): can a complex realtime
-application remain externally owned while Free4Chat supplies temporary Room
-membership, participant projection, lifecycle, and a bounded realtime bridge?
+之后每次 push 到 main 会自动增量部署。
 
-Phase 0 deliberately starts smaller than an SDK/platform:
+## 服务端 API
 
-```text
-#354 shared sandbox host / bounded bridge
-→ Shared Canvas fixture
-+ Tiny realtime arena fixture
-→ architecture + cost decision
-```
+详见 [SERVER_API.md](./SERVER_API.md)，核心接口：
 
-This does **not** reopen a generic Extension framework, marketplace, arbitrary
-URL plugin system, or stable public App SDK. Those would require repeated
-evidence from materially different Apps.
+| 接口 | 说明 |
+|------|------|
+| `POST /api/sfu/session` | 创建会话，返回 participantId/token/sessionId |
+| `GET /api/sfu/ws` | WebSocket 信令通道 |
+| `POST /api/sfu/tracks` | 发布/订阅音视频 track |
 
-## Agent entry paths
+房间限流：满 10 人时返回 `429 {"error":"room_full"}`。
 
-Free4Chat has two first-class Agent entry paths into the same temporary Room.
+## 文档
 
-### Browser-assisted
+- [SERVER_API.md](./SERVER_API.md) — 服务端接口文档（客户端开发用）
+- [REPLICATE.md](./REPLICATE.md) — 复刻部署详细说明
+- [DEPLOY.md](./DEPLOY.md) — 手动部署步骤
 
-Open a Room and use **Invite Agent** to copy a Room-scoped prompt that
-bootstraps the official Runtime.
+## 与官方版的区别
 
-### Developer-native terminal
-
-```text
-# Machine A: create a fresh Room and join Pi.
-free4chat-agent room create --agent pi --name Pi
-
-# Machine B: join Codex using the public Room id.
-free4chat-agent room join <room-id> --agent codex --name Codex
-```
-
-`room create` and `room join` compose ordinary temporary participants: no
-owner/admin role, Agent team, workspace, or implicit work request.
-
-The low-level `create` / `join --room` commands remain stable machine-readable
-interfaces for automation.
-
-See [`app/public/agent.md`](./app/public/agent.md) for the canonical Runtime and
-MCP machine contract.
-
-## MCP Room API
-
-The public MCP endpoint exposes **eighteen stateless tools** for Room
-inspection, lifecycle, text/Task correlation, capabilities, structured
-collaboration, bounded artifacts/surfaces, Task Live View, and leaving.
-
-Direct MCP is the low-level integration path. The resident Runtime is preferred
-when an Agent should remain present across many Room/Task turns.
-
-See [MCP Room API](https://www.free4.chat/docs/reference/mcp).
-
-## Privacy and ownership
-
-Free4Chat minimizes retained Room state. Temporary does not mean serverless in
-the networking sense: a per-Room Durable Object coordinates bounded shared
-state and Cloudflare Realtime SFU relays media/realtime traffic.
-
-**Not permanent Free4Chat history:**
-
-- no account/profile is required;
-- voice is not recorded by Free4Chat;
-- browser file transfers remain ephemeral;
-- Room messages/Tasks/artifacts/Live Views expire with Room retention.
-
-**Participant-private by default:**
-
-- Harness reasoning/history;
-- local tools/files not explicitly shared;
-- browser cookies/authenticated state;
-- provider/API credentials;
-- private model memory.
-
-ACP is a Harness lifecycle/control protocol, not a sandbox. A Harness may own
-powerful local capabilities; its operator/local policy remains authoritative.
-
-## Architecture boundary
-
-```text
-Browser / Human
-        |
-        | Room control/shared state
-        v
-RoomSession Durable Object       Agent Runtime
-        |                             |
-        |                             | ACP
-        |                             v
-        |                           Harness
-        |
-        +---- Cloudflare Realtime SFU / DataChannels
-                 realtime media/data plane
-```
-
-- **Room/DO** - temporary control/shared-state boundary.
-- **SFU/DataChannel** - realtime media/data plane.
-- **Runtime** - local participant lifecycle/media/collaboration bridge.
-- **Harness** - intelligence, tools, private memory, and local permission
-  policy.
-
-## Learn more
-
-- [Documentation](https://www.free4.chat/docs)
-- [Browser Room quick start](https://www.free4.chat/docs/getting-started/browser-room)
-- [Agent Room quick start](https://www.free4.chat/docs/getting-started/agent-room)
-- [Tasks and Live Views](https://www.free4.chat/docs/guides/tasks-and-live-views)
-- [Collaboration patterns](https://www.free4.chat/docs/patterns/collaboration-patterns)
-- [MCP Room API](https://www.free4.chat/docs/reference/mcp)
-- [CLI reference](https://www.free4.chat/docs/reference/cli)
-- [Four evolutions of a WebRTC chat room](https://www.bmpi.dev/dev/free4chat/)
-
-## Tech stack
-
-| Layer | Technology |
-| --- | --- |
-| Frontend | Next.js 15, React 19, Tailwind CSS |
-| API/control | Next.js API routes + per-Room Durable Object on Cloudflare Workers |
-| Media/realtime | Cloudflare Realtime SFU, WebRTC/DataChannels, Pion in the Runtime |
-| Agents | Stateless MCP Room API + self-contained Go Runtime + ACP Harness boundary |
-| Security | Cloudflare Turnstile + Room-scoped authorization/grants + local Harness policy |
-
-## Stack history
-
-Free4Chat has crossed four implementation stacks while keeping the same
-underlying product constraint:
-
-| Branch | Stack | Why it changed |
-| --- | --- | --- |
-| [`golang`](../../tree/golang) | Go + Pion + coturn | self-hosted infrastructure was too heavy |
-| [`elixir`](../../tree/elixir) | Elixir + Membrane | server-cluster maintenance was still too heavy |
-| [`cloudflare`](../../tree/cloudflare) | Workers + RealtimeKit | managed-media pricing/API constraints did not fit |
-| **`cf-sfu`** | Workers + raw Cloudflare Realtime SFU | lower-level, serverless media/data control |
-
-What survived the rewrites is smaller than any one stack:
-
-```text
-temporary
-+ low-friction
-+ participant-owned
-+ ephemeral by default
-+ no permanent workspace required
-```
-
-## Development
-
-See [DEVELOPMENT.md](./DEVELOPMENT.md) for local setup and deployment notes.
+| | 官方版 | 本 fork |
+|---|---|---|
+| 语音+文字 | ✅ | ✅ |
+| Agent/MCP/转写/TTS | ✅ | ❌ 已移除 |
+| Origin 白名单 | 仅 free4.chat | 默认放开（联邦模式） |
+| 房间人数限制 | 无 | 10 人/房 |
+| 界面语言 | 英文 | 中文 |
 
 ## License
 
-MIT
+MIT（继承上游）
