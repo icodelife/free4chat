@@ -17,6 +17,21 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Detect Account ID
+        id: account
+        run: |
+          if [ -n "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" ]; then
+            echo "id=${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" >> $GITHUB_OUTPUT
+          else
+            RESP=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts")
+            ACCOUNT_ID=$(echo "$RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['result'][0]['id'])")
+            echo "id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+            echo "从 token 自动获取账号 ID"
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
       - name: Install dependencies
         run: npm install --legacy-peer-deps --no-audit --no-fund
         working-directory: app
@@ -32,7 +47,7 @@ jobs:
         working-directory: app
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ steps.account.outputs.id }}
 
       - name: Enable workers.dev
         run: |
@@ -40,7 +55,6 @@ jobs:
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
             -H "Content-Type: application/json" \
             -d '{"enabled":true}' \
-            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/voice-chat-client-demo/subdomain"
+            "https://api.cloudflare.com/client/v4/accounts/${{ steps.account.outputs.id }}/workers/scripts/voice-chat-client-demo/subdomain"
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
