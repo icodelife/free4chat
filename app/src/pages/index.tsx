@@ -14,7 +14,30 @@ const DEFAULT_SERVER =
   "https://voice-chat-server.cheng-0b4.workers.dev"
 
 const inputClasses =
-  "w-full rounded-lg border border-gray-700 bg-gray-900 p-3 text-white placeholder-gray-500 focus:border-blue-500 focus:outline-none"
+  "w-full rounded-lg border border-gray-700 bg-gray-900 p-3 pr-10 text-white placeholder-gray-500 focus:border-blue-500 focus:outline-none"
+
+const diceClasses =
+  "text-gray-500 transition hover:text-gray-300 focus:outline-none"
+
+const DiceButton = ({
+  onClick,
+  title,
+}: {
+  onClick: () => void
+  title: string
+}) => (
+  <button onClick={onClick} type="button" className={diceClasses} title={title}>
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 16 16"
+      fill="currentColor"
+      className="h-4 w-4"
+    >
+      <path d="M13 1a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V3a2 2 0 0 1 2-2h10zM3 0a3 3 0 0 0-3 3v10a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3V3a3 3 0 0 0-3-3H3z" />{" "}
+      <path d="M5.5 4a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0zm8 0a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0zm0 8a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0zm-8 0a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0zm4-4a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0z" />
+    </svg>
+  </button>
+)
 
 export default function Home() {
   const router = useRouter()
@@ -78,25 +101,41 @@ export default function Home() {
 
         <div className="mb-4">
           <label className="mb-1 block text-sm text-gray-300">房间号</label>
-          <input
-            className={inputClasses}
-            value={roomName}
-            onChange={(e) => setRoomName(e.target.value)}
-            placeholder="房间号"
-          />
+          <div className="relative">
+            <input
+              className={inputClasses}
+              value={roomName}
+              onChange={(e) => setRoomName(e.target.value)}
+              placeholder="房间号"
+            />
+            <span className="absolute inset-y-0 right-0 grid w-10 place-content-center">
+              <DiceButton
+                onClick={() => setRoomName(generateRoomName())}
+                title="随机房间号"
+              />
+            </span>
+          </div>
         </div>
 
         <div className="mb-6">
           <label className="mb-1 block text-sm text-gray-300">昵称</label>
-          <input
-            className={inputClasses}
-            value={nickName}
-            onChange={(e) => setNickName(e.target.value)}
-            placeholder="你的昵称"
-            onKeyDown={(e) => {
-              if (e.key === "Enter") go()
-            }}
-          />
+          <div className="relative">
+            <input
+              className={inputClasses}
+              value={nickName}
+              onChange={(e) => setNickName(e.target.value)}
+              placeholder="你的昵称"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") go()
+              }}
+            />
+            <span className="absolute inset-y-0 right-0 grid w-10 place-content-center">
+              <DiceButton
+                onClick={() => setNickName(generateParticipantName())}
+                title="随机昵称"
+              />
+            </span>
+          </div>
         </div>
 
         <button
