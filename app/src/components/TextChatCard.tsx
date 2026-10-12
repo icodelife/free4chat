@@ -6,7 +6,6 @@ import React, {
   useCallback,
   memo,
 } from "react"
-import CollabArtifactViewer from "./CollabArtifactViewer"
 
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
@@ -14,8 +13,8 @@ import remarkGfm from "remark-gfm"
 import { LOCAL_PEER_ID } from "@common/consts"
 import { ActionType, Message } from "@common/types"
 import { strToBgColor, umamiEvent, hashRoom } from "@common/utils"
-import { MAX_COLLAB_SUMMARY_LENGTH } from "../common/taskViews"
 
+import CollabArtifactViewer from "./CollabArtifactViewer"
 import {
   buildCollabLifecycleIndex,
   type CollabLifecycleProjection,
@@ -26,6 +25,7 @@ import {
   resolveAgentTargetIds,
   resolveSelectedAgentTargetIds,
 } from "../common/agentMentions"
+import { MAX_COLLAB_SUMMARY_LENGTH } from "../common/taskViews"
 import type { UserInfo } from "../common/types"
 type PermissionEvent = any
 type RoomAttachmentProjection = any
