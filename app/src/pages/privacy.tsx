@@ -24,8 +24,8 @@ export default function PrivacyPage() {
 
         <h2 className="mb-2 mt-6 text-lg font-semibold text-white">数据保留</h2>
         <p className="text-sm">
-          房间在最后一人离开 30 分钟后自动清除所有数据。Durable
-          Object 实例在无人访问时由 Cloudflare 自动回收。
+          房间在最后一人离开 30 分钟后自动清除所有数据。Durable Object
+          实例在无人访问时由 Cloudflare 自动回收。
         </p>
 
         <h2 className="mb-2 mt-6 text-lg font-semibold text-white">语音传输</h2>
