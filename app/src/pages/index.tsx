@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 
 import { useRouter } from "next/router"
 
@@ -12,6 +12,13 @@ import { saveRoomToLocalStorage } from "../common/utils"
 const DEFAULT_SERVER =
   process.env.NEXT_PUBLIC_API_BASE_URL ||
   "https://voice-chat-server.cheng-0b4.workers.dev"
+
+interface RoomListItem {
+  room: string
+  participants: number
+  hasPassword: boolean
+  lastActiveAt: number
+}
 
 const inputClasses =
   "w-full rounded-lg border border-gray-700 bg-gray-900 p-3 pr-10 text-white placeholder-gray-500 focus:border-blue-500 focus:outline-none"
@@ -45,6 +52,8 @@ export default function Home() {
   const [nickName, setNickName] = useState<string>("")
   const [serverUrl, setServerUrl] = useState<string>(DEFAULT_SERVER)
   const [password, setPassword] = useState<string>("")
+  const [rooms, setRooms] = useState<RoomListItem[]>([])
+  const passwordRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     setRoomName(generateRoomName())
@@ -54,20 +63,65 @@ export default function Home() {
     if (saved) setServerUrl(saved)
   }, [])
 
-  const go = () => {
-    if (roomName !== "" && nickName !== "") {
+  // 拉取活跃房间列表（15 秒刷新一次）
+  useEffect(() => {
+    let timer: ReturnType<typeof setInterval> | undefined
+    const fetchRooms = async () => {
+      const base = serverUrl.trim().replace(/\/+$/, "")
+      if (!base) {
+        setRooms([])
+        return
+      }
+      try {
+        const resp = await fetch(`${base}/api/rooms`)
+        if (!resp.ok) {
+          setRooms([])
+          return
+        }
+        const data = (await resp.json()) as { rooms?: RoomListItem[] }
+        setRooms(Array.isArray(data.rooms) ? data.rooms : [])
+      } catch {
+        setRooms([])
+      }
+    }
+    fetchRooms()
+    timer = setInterval(fetchRooms, 15000)
+    return () => {
+      if (timer) clearInterval(timer)
+    }
+  }, [serverUrl])
+
+  const go = (targetRoom?: string, targetPassword?: string) => {
+    const rn = targetRoom ?? roomName
+    const pw = targetPassword ?? password
+    if (rn !== "" && nickName !== "") {
       if (typeof window !== "undefined") {
-        saveRoomToLocalStorage(roomName, nickName)
+        saveRoomToLocalStorage(rn, nickName)
         localStorage.setItem("voice-chat-server-url", serverUrl)
         // 把服务器地址和密码存到 session，供房间页使用
         sessionStorage.setItem("voice-chat-server-url", serverUrl)
-        if (password) {
-          sessionStorage.setItem("voice-chat-room-password", password)
+        if (pw) {
+          sessionStorage.setItem("voice-chat-room-password", pw)
         } else {
           sessionStorage.removeItem("voice-chat-room-password")
         }
       }
-      router.push(`/room?id=${encodeURIComponent(roomName)}`)
+      router.push(`/room?id=${encodeURIComponent(rn)}`)
+    }
+  }
+
+  // 从列表点房间：公开房直接进，密码房填好房号后聚焦密码框
+  const joinFromList = (r: RoomListItem) => {
+    setRoomName(r.room)
+    setPassword("")
+    if (r.hasPassword) {
+      passwordRef.current?.focus()
+      passwordRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      })
+    } else {
+      go(r.room, "")
     }
   }
 
@@ -129,6 +183,7 @@ export default function Home() {
           </label>
           <input
             type="password"
+            ref={passwordRef}
             className={inputClasses}
             value={password}
             onChange={(e) => setPassword(e.target.value)}
@@ -164,7 +219,7 @@ export default function Home() {
         </div>
 
         <button
-          onClick={go}
+          onClick={() => go()}
           className="w-full rounded-lg bg-blue-600 py-3 font-medium text-white transition hover:bg-blue-500"
           style={{ boxShadow: "none" }}
         >
@@ -174,6 +229,32 @@ export default function Home() {
         <p className="mt-4 text-center text-xs text-gray-500">
           分享链接给朋友：{serverUrl}/room?id=房间号
         </p>
+
+        {rooms.length > 0 && (
+          <div className="mt-6 border-t border-gray-800 pt-4">
+            <p className="mb-2 text-sm text-gray-300">
+              活跃房间 <span className="text-gray-500">（点击直接加入）</span>
+            </p>
+            <div className="max-h-48 space-y-2 overflow-y-auto">
+              {rooms.map((r) => (
+                <button
+                  key={r.room}
+                  onClick={() => joinFromList(r)}
+                  type="button"
+                  className="flex w-full items-center justify-between rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-left transition hover:border-gray-600"
+                >
+                  <span className="truncate text-sm text-white">
+                    {r.hasPassword ? "🔒 " : ""}
+                    {r.room}
+                  </span>
+                  <span className="ml-2 shrink-0 text-xs text-gray-500">
+                    {r.participants} 人在线
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )
