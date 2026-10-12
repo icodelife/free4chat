@@ -1,0 +1,12 @@
+# Cloudflare Realtime SFU
+SFU_APP_ID=your_realtime_sfu_app_id
+SFU_APP_SECRET=your_realtime_sfu_app_secret
+# Turnstile (use test keys below for local dev — always pass)
+NEXT_PUBLIC_TURNSTILE_SITE_KEY=your_turnstile_site_key (build-time env for turnstile)
+TURNSTILE_SECRET_KEY=your_turnstile_secret_key
+
+# Phase-0 (#82) MediaBridge dev/test switch — NOT the production
+# authorization model. Production CI explicitly enables the coarse switch;
+# the per-room Human Meeting Notes grant remains required. Uncomment locally
+# only to test the agent-session / agent-room-media routes.
+# AGENT_MEDIA_ENABLED=true

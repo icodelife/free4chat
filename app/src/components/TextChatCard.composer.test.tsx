@@ -1,0 +1,439 @@
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+
+import type { Message, UserInfo } from "@common/types"
+
+import TextChatCard from "./TextChatCard"
+
+function agentParticipant(): UserInfo {
+  return {
+    peerId: "agent-1",
+    name: "Agent B",
+    kind: "agent",
+    room: "room",
+  }
+}
+
+function renderCard(
+  props: Partial<React.ComponentProps<typeof TextChatCard>> = {}
+) {
+  const onSendText = vi.fn()
+  const onSendFile = vi.fn()
+  const onSendAction = vi.fn()
+  const view = render(
+    <TextChatCard
+      room="room"
+      nickName="Human"
+      messages={[]}
+      participants={[agentParticipant()]}
+      onSendText={onSendText}
+      onSendFile={onSendFile}
+      onSendAction={onSendAction}
+      {...props}
+    />
+  )
+  const composer = screen.getByLabelText(
+    "Message the room or @ an Agent"
+  ) as HTMLTextAreaElement
+  return { view, onSendText, onSendFile, onSendAction, composer }
+}
+
+function typeMessage(composer: HTMLTextAreaElement, value: string) {
+  // React 19's value tracker breaks fireEvent.change's own-property path on
+  // controlled textareas; set through the prototype setter explicitly.
+  const setter = Object.getOwnPropertyDescriptor(
+    HTMLTextAreaElement.prototype,
+    "value"
+  )?.set
+  setter!.call(composer, value)
+  composer.dispatchEvent(new Event("input", { bubbles: true }))
+  composer.selectionStart = value.length
+  composer.selectionEnd = value.length
+}
+
+/** Simulate typing so the caret sits mid-text when React re-renders. */
+function typeAtCaret(
+  composer: HTMLTextAreaElement,
+  value: string,
+  caret: number
+) {
+  const setter = Object.getOwnPropertyDescriptor(
+    HTMLTextAreaElement.prototype,
+    "value"
+  )?.set
+  setter!.call(composer, value)
+  composer.selectionStart = caret
+  composer.selectionEnd = caret
+  composer.dispatchEvent(new Event("input", { bubbles: true }))
+}
+
+beforeEach(() => {
+  Element.prototype.scrollIntoView = vi.fn()
+})
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+  vi.restoreAllMocks()
+})
+
+describe("composer keyboard semantics", () => {
+  it("sends on Enter with the trimmed text and clears the composer", () => {
+    const { composer, onSendText } = renderCard()
+    typeMessage(composer, "  hello room  ")
+    fireEvent.keyDown(composer, { key: "Enter" })
+    expect(onSendText).toHaveBeenCalledWith("hello room", [])
+    expect(composer.value).toBe("")
+  })
+
+  it("does not send on Shift+Enter so newlines can be composed", () => {
+    const { composer, onSendText } = renderCard()
+    typeMessage(composer, "line one")
+    fireEvent.keyDown(composer, { key: "Enter", shiftKey: true })
+    expect(onSendText).not.toHaveBeenCalled()
+    expect(composer.value).toBe("line one")
+  })
+
+  it("does not send empty or whitespace-only content on Enter", () => {
+    const { composer, onSendText } = renderCard()
+    typeMessage(composer, "   ")
+    fireEvent.keyDown(composer, { key: "Enter" })
+    expect(onSendText).not.toHaveBeenCalled()
+  })
+
+  it("does not send while an IME composition is in progress", () => {
+    const { composer, onSendText } = renderCard()
+    typeMessage(composer, "ni hao")
+    fireEvent.compositionStart(composer)
+    fireEvent.keyDown(composer, { key: "Enter" })
+    expect(onSendText).not.toHaveBeenCalled()
+    fireEvent.compositionEnd(composer)
+    fireEvent.keyDown(composer, { key: "Enter" })
+    expect(onSendText).toHaveBeenCalledWith("ni hao", [])
+  })
+
+  it("keeps Enter as a newline on coarse pointers and sends via the button", () => {
+    vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true }))
+    const { composer, onSendText } = renderCard()
+    typeMessage(composer, "from mobile")
+    fireEvent.keyDown(composer, { key: "Enter" })
+    expect(onSendText).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByLabelText("Send message"))
+    expect(onSendText).toHaveBeenCalledWith("from mobile", [])
+  })
+
+  it("resolves @Agent targets from the textarea picker at the caret", async () => {
+    const { composer, onSendText } = renderCard()
+    // The mention is mid-text; the caret sits right after "@Age" as it would
+    // while typing.
+    typeAtCaret(composer, "@Age please review", 4)
+
+    const option = await screen.findByText("Agent B")
+    expect(option).toBeInTheDocument()
+
+    // Arrow keys move the highlight; Enter picks the highlighted Agent.
+    fireEvent.keyDown(composer, { key: "ArrowDown" })
+    fireEvent.keyDown(composer, { key: "ArrowUp" })
+    fireEvent.keyDown(composer, { key: "Enter" })
+
+    await waitFor(() => expect(composer.value).toContain("@Agent B "))
+    fireEvent.keyDown(composer, { key: "Enter" })
+    expect(onSendText).toHaveBeenCalledWith(
+      expect.stringContaining("@Agent B"),
+      ["agent-1"]
+    )
+  })
+
+  it("sends task text with the existing task correlation and primary routing by default", () => {
+    const { composer, onSendText } = renderCard({
+      taskRequestId: "task-123",
+    })
+    typeMessage(composer, "continue the task")
+    fireEvent.keyDown(composer, { key: "Enter" })
+    expect(onSendText).toHaveBeenCalledWith("continue the task", [], "task-123")
+    expect(screen.queryByLabelText("More actions")).not.toBeInTheDocument()
+  })
+
+  it("scrolls only the timeline container when messages change", () => {
+    const originalScrollTo = HTMLElement.prototype.scrollTo
+    const scrollTo = vi.fn()
+    Object.defineProperty(HTMLElement.prototype, "scrollTo", {
+      configurable: true,
+      value: scrollTo,
+    })
+
+    const { view } = renderCard()
+    scrollTo.mockClear()
+    view.rerender(
+      <TextChatCard
+        room="room"
+        nickName="Human"
+        messages={[
+          {
+            peerId: "agent-1",
+            name: "Agent B",
+            kind: "agent",
+            type: "text",
+            text: "new",
+          },
+        ]}
+        participants={[agentParticipant()]}
+        onSendText={vi.fn()}
+        onSendFile={vi.fn()}
+        onSendAction={vi.fn()}
+      />
+    )
+
+    expect(scrollTo).toHaveBeenCalledWith({ top: 0, behavior: "smooth" })
+    expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled()
+    Object.defineProperty(HTMLElement.prototype, "scrollTo", {
+      configurable: true,
+      value: originalScrollTo,
+    })
+  })
+
+  it("sends a selected Agent participant id from a Task composer", async () => {
+    const { composer, onSendText } = renderCard({
+      taskRequestId: "task-123",
+    })
+    typeAtCaret(composer, "@Age please review", 4)
+
+    fireEvent.mouseDown(await screen.findByText("Agent B"))
+    await waitFor(() => expect(composer.value).toContain("@Agent B "))
+    fireEvent.keyDown(composer, { key: "Enter" })
+
+    expect(onSendText).toHaveBeenCalledWith(
+      expect.stringContaining("@Agent B"),
+      ["agent-1"],
+      "task-123"
+    )
+  })
+
+  it("does not route a hand-typed Task @Name without semantic selection", () => {
+    const { composer, onSendText } = renderCard({
+      taskRequestId: "task-123",
+    })
+    typeMessage(composer, "@Agent B please review")
+    fireEvent.keyDown(composer, { key: "Enter" })
+
+    expect(onSendText).toHaveBeenCalledWith(
+      "@Agent B please review",
+      [],
+      "task-123"
+    )
+  })
+
+  it("dismisses the mention picker with Escape so Enter sends normally", () => {
+    const { composer, onSendText } = renderCard()
+    typeMessage(composer, "@Age")
+    composer.selectionStart = 4
+    composer.selectionEnd = 4
+
+    fireEvent.keyDown(composer, { key: "Escape" })
+    fireEvent.keyDown(composer, { key: "Enter" })
+    expect(onSendText).toHaveBeenCalledWith("@Age", [])
+  })
+
+  it("only suggests current Room action slash commands", () => {
+    const { composer } = renderCard()
+    act(() => typeMessage(composer, "/"))
+    expect(screen.getByRole("button", { name: /\/poll/ })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: /\/draw/ })).toBeNull()
+    expect(screen.queryByRole("button", { name: /\/games/ })).toBeNull()
+
+    act(() => typeMessage(composer, "/draw"))
+    expect(screen.queryByRole("button", { name: /\/draw/ })).toBeNull()
+    act(() => typeMessage(composer, "/games"))
+    expect(screen.queryByRole("button", { name: /\/games/ })).toBeNull()
+  })
+
+  it("continues to render historical Whiteboard and game action messages", () => {
+    renderCard({
+      messages: [
+        {
+          peerId: "human-legacy",
+          name: "Earlier Human",
+          kind: "human",
+          type: "action",
+          actionType: "whiteboard",
+          actionPayload: { url: "https://excalidraw.com/#room=old,key" },
+          sequence: 1,
+        },
+        {
+          peerId: "human-legacy",
+          name: "Earlier Human",
+          kind: "human",
+          type: "action",
+          actionType: "game",
+          actionPayload: { gameId: "skribbl" },
+          sequence: 2,
+        },
+      ],
+    })
+
+    expect(
+      screen.getByRole("link", { name: /Open Whiteboard/ })
+    ).toHaveAttribute("href", "https://excalidraw.com/#room=old,key")
+    expect(screen.getByRole("link", { name: /skribbl\.io/ })).toHaveAttribute(
+      "href",
+      "https://skribbl.io"
+    )
+  })
+})
+
+describe("markdown rendering", () => {
+  function agentMarkdownMessage(text: string): Message {
+    return {
+      peerId: "agent-1",
+      name: "Agent B",
+      kind: "agent",
+      type: "text",
+      messageId: "m-1",
+      sequence: 1,
+      createdAt: Date.now(),
+      text,
+    }
+  }
+
+  it("renders GFM structure: headings, lists, tables, inline code, links", () => {
+    renderCard({
+      messages: [
+        agentMarkdownMessage(
+          [
+            "## Review",
+            "",
+            "- one",
+            "- two",
+            "",
+            "1. first",
+            "",
+            "| col | value |",
+            "| --- | ----- |",
+            "| a | b |",
+            "",
+            "Use `send_text` and see [docs](https://example.com/docs).",
+          ].join("\n")
+        ),
+      ],
+    })
+
+    expect(screen.getByRole("heading", { name: "Review" })).toBeInTheDocument()
+    expect(screen.getByText("one").tagName).toBe("LI")
+    expect(screen.getByText("first").tagName).toBe("LI")
+    expect(screen.getByRole("table")).toBeInTheDocument()
+    expect(screen.getByText("send_text").tagName).toBe("CODE")
+    const link = screen.getByRole("link", { name: "docs" })
+    expect(link).toHaveAttribute("target", "_blank")
+    expect(link).toHaveAttribute("rel", "noopener noreferrer")
+    expect(link).toHaveAttribute("href", "https://example.com/docs")
+  })
+
+  it("never executes raw HTML from Markdown", () => {
+    const { view } = renderCard({
+      messages: [
+        agentMarkdownMessage(
+          [
+            "hello",
+            "",
+            "<script>window.__pwned = true</script>",
+            "",
+            '<img src=x onerror="window.__pwned = true" />',
+            "",
+            "![x](javascript:alert(1))",
+          ].join("\n")
+        ),
+      ],
+    })
+    expect(view.container.querySelector("script")).toBeNull()
+    expect(view.container.querySelector("img")).toBeNull()
+    expect((window as { __pwned?: boolean }).__pwned).toBeUndefined()
+  })
+
+  it("renders fenced code blocks with a language label and Copy", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.assign(navigator, { clipboard: { writeText } })
+    renderCard({
+      messages: [agentMarkdownMessage("```ts\nconst foo = 1\n```")],
+    })
+
+    expect(screen.getByText("ts")).toBeInTheDocument()
+    const pre = screen
+      .getByRole("button", { name: "Copy code" })
+      .closest("div")?.parentElement
+    expect(pre?.querySelector("code")?.textContent).toBe("const foo = 1")
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy code" }))
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("const foo = 1"))
+    expect(await screen.findByText("Copied!")).toBeInTheDocument()
+  })
+
+  it("keeps plain-line text messages readable without Markdown noise", () => {
+    renderCard({
+      messages: [agentMarkdownMessage("看一下这个？")],
+    })
+    expect(screen.getByText("看一下这个？")).toBeInTheDocument()
+  })
+})
+
+describe("secondary action menu", () => {
+  it("keeps only Attach file and Poll in the Room actions menu", () => {
+    const { onSendAction } = renderCard()
+
+    // The legacy first-class pills are gone from the composer.
+    expect(screen.queryByText("Draw")).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText("More actions"))
+    const menu = screen.getByText("Room actions").parentElement
+    expect(menu).not.toBeNull()
+    expect(within(menu!).getAllByRole("button")).toHaveLength(2)
+    expect(within(menu!).getByText("Attach file")).toBeInTheDocument()
+    expect(within(menu!).getByText("Poll")).toBeInTheDocument()
+    expect(screen.queryByText("Whiteboard")).not.toBeInTheDocument()
+    expect(screen.queryByText("Games")).not.toBeInTheDocument()
+    expect(onSendAction).not.toHaveBeenCalled()
+  })
+
+  it("opens the Poll creator from the + menu and still sends polls", () => {
+    const { onSendAction } = renderCard()
+    fireEvent.click(screen.getByLabelText("More actions"))
+    fireEvent.click(screen.getByText("Poll"))
+
+    fireEvent.change(screen.getByPlaceholderText("Question..."), {
+      target: { value: "Lunch?" },
+    })
+    const options = screen.getAllByPlaceholderText(/Option/)
+    fireEvent.change(options[0], { target: { value: "A" } })
+    fireEvent.change(options[1], { target: { value: "B" } })
+    fireEvent.click(screen.getByText("Send"))
+
+    expect(onSendAction).toHaveBeenCalledWith(
+      "poll",
+      expect.objectContaining({ question: "Lunch?" })
+    )
+  })
+
+  it("keeps file attachment reachable through the + menu and closes it first", () => {
+    const { view, onSendFile } = renderCard()
+    const fileInput = view.container.querySelector(
+      'input[type="file"]'
+    ) as HTMLInputElement
+    const clickSpy = vi.spyOn(fileInput, "click")
+    fireEvent.click(screen.getByLabelText("More actions"))
+    fireEvent.click(screen.getByText("Attach file"))
+    expect(clickSpy).toHaveBeenCalled()
+
+    // The menu closes before the native picker opens — on mobile the bottom
+    // sheet must not still cover the composer when the picker returns.
+    expect(screen.queryByText("Attach file")).not.toBeInTheDocument()
+
+    // The DataChannel send flow itself is unchanged.
+    expect(onSendFile).not.toHaveBeenCalled()
+  })
+})

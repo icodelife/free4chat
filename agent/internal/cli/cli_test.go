@@ -1,0 +1,1314 @@
+package cli
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+	"unicode"
+
+	"github.com/i365dev/free4chat/agent/internal/daemon"
+	"github.com/i365dev/free4chat/agent/internal/doctor"
+)
+
+var binaryPath string
+
+// TestMain builds the real free4chat-agent binary once: the routing
+// regression guard (#105 review) pins dispatcher behavior via subprocess
+// exits, which requires the actual executable.
+//
+// After the suite it also enforces the #172 leak invariant: ZERO daemon
+// process spawned by these tests may survive. The scan is keyed on the full
+// unique build path, so it can only ever observe processes from THIS test
+// run — the user's canonical ~/.free4chat-agent daemon can never match.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "fcagent-cli-")
+	if err != nil {
+		panic(err)
+	}
+	bin := filepath.Join(dir, "free4chat-agent")
+	build := exec.Command("go", "build", "-o", bin, "../../cmd/free4chat-agent")
+	if out, err := build.CombinedOutput(); err != nil {
+		panic("binary build failed: " + string(out))
+	}
+	binaryPath = bin
+	code := m.Run()
+	leaked := waitForNoTestDaemons(5 * time.Second)
+	if len(leaked) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"\nFAIL: %d detached free4chat-agent daemon(s) leaked from CLI tests (owned by %s):\n",
+			len(leaked), bin)
+		for _, provenance := range leaked {
+			fmt.Fprintln(os.Stderr, "  "+provenance)
+		}
+		if code == 0 {
+			code = 1
+		}
+	}
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
+
+// testDaemonProcs lists "PID command" lines for every process whose command
+// line contains this run's built binary path. pgrep exits 1 on "no match",
+// which is the healthy empty case.
+func testDaemonProcs() ([]string, error) {
+	out, err := exec.Command("pgrep", "-f", regexp.QuoteMeta(binaryPath)).Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var provenance []string
+	for _, pid := range strings.Fields(string(out)) {
+		command, procErr := exec.Command("ps", "-p", pid, "-o", "command=").Output()
+		if procErr != nil {
+			// The process may have exited between pgrep and ps: it is gone,
+			// which is the desired state.
+			continue
+		}
+		provenance = append(provenance, strings.TrimSpace(pid+" "+string(command)))
+	}
+	return provenance, nil
+}
+
+// waitForNoTestDaemons polls until no test-owned daemon process remains and
+// returns whatever still survives when the deadline passes.
+func waitForNoTestDaemons(timeout time.Duration) []string {
+	deadline := time.Now().Add(timeout)
+	for {
+		procs, err := testDaemonProcs()
+		if err == nil && len(procs) == 0 {
+			return nil
+		}
+		if err != nil {
+			// The process scan itself is unavailable (no pgrep/ps): degrade
+			// to a warning instead of a false failure.
+			fmt.Fprintf(os.Stderr, "warning: daemon leak scan unavailable: %v\n", err)
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return procs
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// withAgentDir scopes FREE4CHAT_AGENT_DIR for one helper call and always
+// restores the previous environment.
+func withAgentDir(dir string, fn func()) {
+	previous, had := os.LookupEnv("FREE4CHAT_AGENT_DIR")
+	_ = os.Setenv("FREE4CHAT_AGENT_DIR", dir)
+	defer func() {
+		if had {
+			_ = os.Setenv("FREE4CHAT_AGENT_DIR", previous)
+		} else {
+			_ = os.Unsetenv("FREE4CHAT_AGENT_DIR")
+		}
+	}()
+	fn()
+}
+
+// daemonReachable reports whether a daemon answers a status probe on this
+// runtime directory's socket.
+func daemonReachable(dir string) bool {
+	reachable := false
+	withAgentDir(dir, func() {
+		_, err := daemon.SendIPC(&daemon.IpcRequest{Op: "status"})
+		reachable = err == nil
+	})
+	return reachable
+}
+
+// stopTestDaemon reclaims the daemon owned by THIS test's runtime directory
+// (#172): it uses the daemon's own stop op over IPC — never a signal or
+// pattern kill — and then waits deterministically until the socket stops
+// answering, which the daemon guarantees during its own shutdown. A daemon
+// that was never spawned for this directory is a no-op.
+func stopTestDaemon(t *testing.T, dir string) {
+	t.Helper()
+	if !daemonReachable(dir) {
+		return
+	}
+	withAgentDir(dir, func() {
+		_, _ = daemon.SendIPC(&daemon.IpcRequest{Op: "stop"})
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for daemonReachable(dir) {
+		if time.Now().After(deadline) {
+			t.Errorf("test daemon in %s kept its IPC socket after the stop op", dir)
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func runCli(t *testing.T, args ...string) (string, int) {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "fcagent-")
+	if err != nil {
+		t.Fatalf("temp dir failed: %v", err)
+	}
+	// #172: any invocation that routes through the daemon (status, leave,
+	// stop, ...) auto-starts a detached daemon in this unique directory via
+	// EnsureDaemon. Reclaim exactly that daemon during cleanup — production
+	// detach semantics stay untouched, and no other daemon can ever match.
+	// Stop MUST happen before the directory removal (socket lives in it).
+	t.Cleanup(func() {
+		stopTestDaemon(t, dir)
+		_ = os.RemoveAll(dir)
+	})
+	cmd := exec.Command(binaryPath, args...)
+	cmd.Env = append(os.Environ(),
+		"FREE4CHAT_AGENT_DIR="+dir,
+		"FREE4CHAT_TEST_DISABLE_NATIVE_CREDENTIAL_STORE=1",
+	)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	stdout, err := cmd.Output()
+	out := string(stdout) + stderr.String()
+	if err == nil {
+		return out, 0
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		return out, exitErr.ExitCode()
+	}
+	t.Fatalf("cli run failed: %v", err)
+	return out, -1
+}
+
+// fakeDaemon is a small IPC-only fixture for CLI composition tests. It speaks
+// the existing daemon envelope and records operations, so these tests prove
+// the room namespace does not invent a second daemon protocol.
+type fakeDaemon struct {
+	dir      string
+	listener net.Listener
+	requests chan daemon.IpcRequest
+	response func(daemon.IpcRequest) daemon.IpcResponse
+}
+
+func newFakeDaemon(t *testing.T, response func(daemon.IpcRequest) daemon.IpcResponse) *fakeDaemon {
+	t.Helper()
+	// Unix socket paths on macOS have a small fixed maximum. t.TempDir()
+	// includes the full test name, which can exceed it; use the same short
+	// temporary-directory pattern as the subprocess helper above.
+	dir, err := os.MkdirTemp("", "fcagent-fake-")
+	if err != nil {
+		t.Fatalf("fake daemon temp directory failed: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	listener, err := net.Listen("unix", filepath.Join(dir, "daemon.sock"))
+	if err != nil {
+		t.Fatalf("fake daemon listen failed: %v", err)
+	}
+	fixture := &fakeDaemon{
+		dir:      dir,
+		listener: listener,
+		requests: make(chan daemon.IpcRequest, 16),
+		response: response,
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go fixture.serve()
+	return fixture
+}
+
+func (d *fakeDaemon) serve() {
+	for {
+		conn, err := d.listener.Accept()
+		if err != nil {
+			return
+		}
+		go d.serveOne(conn)
+	}
+}
+
+func (d *fakeDaemon) serveOne(conn net.Conn) {
+	defer conn.Close()
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		return
+	}
+	request, err := daemon.DecodeRequest([]byte(strings.TrimSpace(line)))
+	if err != nil {
+		return
+	}
+	d.requests <- *request
+	response, err := json.Marshal(d.response(*request))
+	if err == nil {
+		_, _ = conn.Write(append(response, '\n'))
+	}
+}
+
+func runCliWithFakeDaemon(t *testing.T, fixture *fakeDaemon, args ...string) (string, int) {
+	t.Helper()
+	cmd := exec.Command(binaryPath, args...)
+	cmd.Env = append(os.Environ(),
+		"FREE4CHAT_AGENT_DIR="+fixture.dir,
+		"FREE4CHAT_TEST_DISABLE_NATIVE_CREDENTIAL_STORE=1",
+	)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	stdout, err := cmd.Output()
+	output := string(stdout) + stderr.String()
+	if err == nil {
+		return output, 0
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		return output, exitErr.ExitCode()
+	}
+	t.Fatalf("CLI run against fake daemon failed: %v", err)
+	return output, -1
+}
+
+func nextFakeRequest(t *testing.T, fixture *fakeDaemon) daemon.IpcRequest {
+	t.Helper()
+	select {
+	case request := <-fixture.requests:
+		return request
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for fake daemon request")
+		return daemon.IpcRequest{}
+	}
+}
+
+func TestContextReadPreservesExplicitZeroCursorPresenceOverIPC(t *testing.T) {
+	fixture := newFakeDaemon(t, func(request daemon.IpcRequest) daemon.IpcResponse {
+		if request.Op == "status" {
+			return daemon.IpcResponse{OK: true, Result: []any{}}
+		}
+		return daemon.IpcResponse{OK: true, Result: map[string]any{}}
+	})
+	_, code := runCliWithFakeDaemon(t, fixture, "context", "read",
+		"--before-sequence", "0", "--after-sequence", "0",
+		"--before-transcript-sequence", "0", "--after-transcript-sequence", "0")
+	if code != 0 {
+		t.Fatalf("context read with explicit zero cursors exited %d", code)
+	}
+	if status := nextFakeRequest(t, fixture); status.Op != "status" {
+		t.Fatalf("context read preflight = %q, want status", status.Op)
+	}
+	request := nextFakeRequest(t, fixture)
+	for name, cursor := range map[string]*int64{
+		"beforeSequence": request.BeforeSequence, "afterSequence": request.AfterSequence,
+		"beforeTranscriptSequence": request.BeforeTranscriptSequence,
+		"afterTranscriptSequence":  request.AfterTranscriptSequence,
+	} {
+		if cursor == nil || *cursor != 0 {
+			t.Fatalf("explicit zero %s was lost over IPC: %#v", name, request)
+		}
+	}
+
+	_, code = runCliWithFakeDaemon(t, fixture, "context", "read")
+	if code != 0 {
+		t.Fatalf("context read without cursors exited %d", code)
+	}
+	if status := nextFakeRequest(t, fixture); status.Op != "status" {
+		t.Fatalf("context read preflight = %q, want status", status.Op)
+	}
+	request = nextFakeRequest(t, fixture)
+	if request.BeforeSequence != nil || request.AfterSequence != nil ||
+		request.BeforeTranscriptSequence != nil || request.AfterTranscriptSequence != nil {
+		t.Fatalf("omitted context cursors were sent over IPC: %#v", request)
+	}
+}
+
+func roomFixture(t *testing.T, createResult, joinResult json.RawMessage) *fakeDaemon {
+	t.Helper()
+	return newFakeDaemon(t, func(request daemon.IpcRequest) daemon.IpcResponse {
+		switch request.Op {
+		case "status":
+			return daemon.IpcResponse{OK: true, Result: []any{}}
+		case "daemon-info":
+			return daemon.IpcResponse{OK: true, Result: daemon.DaemonInfo{DaemonVersion: doctor.Version}}
+		case "create":
+			return daemon.IpcResponse{OK: true, Result: createResult}
+		case "join":
+			return daemon.IpcResponse{OK: true, Result: joinResult}
+		default:
+			return daemon.IpcResponse{OK: false, Error: "unexpected fake daemon operation"}
+		}
+	})
+}
+
+// TestTestDaemonStopIsScopedAndDeterministic pins the reclaim contract the
+// whole suite relies on: the daemon's own stop op tears down the socket and
+// then the process, without any signal or pattern kill, and nothing else is
+// affected.
+func TestTestDaemonStopIsScopedAndDeterministic(t *testing.T) {
+	dir, err := os.MkdirTemp("", "fcagent-")
+	if err != nil {
+		t.Fatalf("temp dir failed: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	command := exec.Command(binaryPath, "daemon")
+	command.Env = append(os.Environ(),
+		"FREE4CHAT_AGENT_DIR="+dir,
+		"FREE4CHAT_TEST_DISABLE_NATIVE_CREDENTIAL_STORE=1",
+	)
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := command.Start(); err != nil {
+		t.Fatalf("daemon spawn failed: %v", err)
+	}
+	exited := make(chan struct{})
+	go func() {
+		_ = command.Wait()
+		close(exited)
+	}()
+	// Safety net so a mid-test failure cannot leak the daemon past the
+	// TestMain invariant scan.
+	t.Cleanup(func() {
+		_ = command.Process.Kill()
+		<-exited
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !daemonReachable(dir) {
+		if time.Now().After(deadline) {
+			t.Fatalf("test daemon never answered on its socket")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	stopTestDaemon(t, dir)
+
+	if daemonReachable(dir) {
+		t.Fatalf("socket must stop answering after the daemon's own stop op")
+	}
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("daemon process must exit after its stop op")
+	}
+}
+
+func TestCliRoutingNeverFallsThroughSilently(t *testing.T) {
+	for _, args := range [][]string{
+		{"status"},
+		{"leave", "some-instance"},
+		{"stop"},
+	} {
+		output, code := runCli(t, args...)
+		if strings.TrimSpace(output) == "" {
+			t.Fatalf("cli %v produced no output", args)
+		}
+		if code != 0 {
+			t.Fatalf("cli %v exited %d: %s", args, code, output)
+		}
+	}
+}
+
+func TestCreateRejectsRoomFlagAndMissingLauncher(t *testing.T) {
+	for _, args := range [][]string{
+		{"create", "--room", "some-room", "--agent", "opencode", "--name", "A"},
+		{"create", "--name", "A"},
+		{"create", "--agent", "opencode"},
+		{"create", "--agent", "opencode", "--agent-command", "x", "--name", "A"},
+	} {
+		output, code := runCli(t, args...)
+		if code != 2 {
+			t.Fatalf("create %v should usage()-exit with 2, got %d (%q)", args, code, output)
+		}
+		if !strings.Contains(output, "free4chat-agent create") {
+			t.Fatalf("usage text must mention the command: %q", output)
+		}
+	}
+}
+
+func TestRoomCommandsReuseCreateAndJoinDaemonOperations(t *testing.T) {
+	createResult := json.RawMessage(`{
+  "state":"waiting",
+  "roomId":"room-created",
+  "name":"Pi",
+  "invite":{"kind":"free4chat.room-invite","version":1,"roomId":"room-created","roomUrl":"https://www.free4.chat/room?id=room-created"}
+}`)
+	joinResult := json.RawMessage(`{
+  "state":"waiting",
+  "roomId":"room-created",
+  "name":"Codex"
+}`)
+	fixture := roomFixture(t, createResult, joinResult)
+
+	createOutput, createCode := runCliWithFakeDaemon(t, fixture,
+		"room", "create", "--agent", "pi", "--name", "Pi", "--capability", "code.edit")
+	if createCode != 0 {
+		t.Fatalf("room create failed: %d %q", createCode, createOutput)
+	}
+	if !strings.Contains(createOutput, "Created temporary Room") ||
+		!strings.Contains(createOutput, "Pi joined") ||
+		!strings.Contains(createOutput, "Room: room-created") ||
+		!strings.Contains(createOutput, "Human UI: https://www.free4.chat/room?id=room-created") {
+		t.Fatalf("room create human output mismatch: %q", createOutput)
+	}
+	if request := nextFakeRequest(t, fixture); request.Op != "status" {
+		t.Fatalf("room create must retain normal daemon readiness check, got %+v", request)
+	}
+	createRequest := nextFakeRequest(t, fixture)
+	if createRequest.Op != "create" || createRequest.Room != "" ||
+		createRequest.Agent != "pi" || createRequest.Name != "Pi" ||
+		!reflect.DeepEqual(createRequest.Capabilities, []string{"code.edit"}) {
+		t.Fatalf("room create must submit the legacy create request, got %+v", createRequest)
+	}
+
+	joinOutput, joinCode := runCliWithFakeDaemon(t, fixture,
+		"room", "join", "room-created", "--agent", "codex", "--name", "Codex", "--capability", "shell")
+	if joinCode != 0 {
+		t.Fatalf("room join failed: %d %q", joinCode, joinOutput)
+	}
+	if !strings.Contains(joinOutput, "Codex joined") ||
+		!strings.Contains(joinOutput, "Room: room-created") {
+		t.Fatalf("room join human output mismatch: %q", joinOutput)
+	}
+	if request := nextFakeRequest(t, fixture); request.Op != "daemon-info" {
+		t.Fatalf("room join must retain daemon version handshake, got %+v", request)
+	}
+	joinRequest := nextFakeRequest(t, fixture)
+	if joinRequest.Op != "join" || joinRequest.Room != "room-created" ||
+		joinRequest.Agent != "codex" || joinRequest.Name != "Codex" ||
+		!reflect.DeepEqual(joinRequest.Capabilities, []string{"shell"}) {
+		t.Fatalf("room join must submit the legacy join request, got %+v", joinRequest)
+	}
+}
+
+func TestRoomJoinPreservesCustomLauncherAndAllowsMultipleLocalResidents(t *testing.T) {
+	joinResult := json.RawMessage(`{"state":"waiting","roomId":"shared-room"}`)
+	fixture := roomFixture(t, json.RawMessage(`{}`), joinResult)
+
+	for _, command := range [][]string{
+		{"room", "join", "shared-room", "--agent-command", "custom-acp", "--agent-arg", "--stdio", "--agent-arg", "json", "--name", "Custom"},
+		{"room", "join", "shared-room", "--agent", "hermes", "--name", "Hermes"},
+	} {
+		output, code := runCliWithFakeDaemon(t, fixture, command...)
+		if code != 0 {
+			t.Fatalf("%v failed: %d %q", command, code, output)
+		}
+		if request := nextFakeRequest(t, fixture); request.Op != "daemon-info" {
+			t.Fatalf("room join must use the existing daemon handshake, got %+v", request)
+		}
+		request := nextFakeRequest(t, fixture)
+		if request.Op != "join" || request.Room != "shared-room" {
+			t.Fatalf("room join must not impose a team/group restriction, got %+v", request)
+		}
+		if request.AgentCommand == "custom-acp" && !reflect.DeepEqual(request.AgentArgs, []string{"--stdio", "json"}) {
+			t.Fatalf("custom launcher arguments changed: %+v", request)
+		}
+	}
+}
+
+func TestRoomHumanOutputExcludesDaemonPrivateFields(t *testing.T) {
+	createResult := json.RawMessage(`{
+  "roomId":"safe-room",
+  "participantId":"participant-visible-but-unneeded",
+  "participantHandle":"participant-handle-private",
+  "participantToken":"participant-token-private",
+  "runtimeProviderHandle":"provider-handle-private",
+  "providerClaim":"provider-claim-private",
+  "runtimeProviderProof":"provider-proof-private",
+  "sfuSessionId":"sfu-session-private",
+  "internalSecret":"internal-secret-private",
+  "invite":{"kind":"free4chat.room-invite","version":1,"roomId":"safe-room","roomUrl":"https://www.free4.chat/room?id=safe-room"}
+}`)
+	joinResult := json.RawMessage(`{
+  "roomId":"safe-room",
+  "participantId":"participant-visible-but-unneeded",
+  "participantHandle":"participant-handle-private",
+  "participantToken":"participant-token-private",
+  "runtimeProviderHandle":"provider-handle-private",
+  "providerClaim":"provider-claim-private",
+  "runtimeProviderProof":"provider-proof-private",
+  "sfuSessionId":"sfu-session-private",
+  "internalSecret":"internal-secret-private"
+}`)
+	fixture := roomFixture(t, createResult, joinResult)
+
+	createOutput, createCode := runCliWithFakeDaemon(t, fixture,
+		"room", "create", "--agent", "pi", "--name", "Pi")
+	if createCode != 0 {
+		t.Fatalf("room create failed: %d %q", createCode, createOutput)
+	}
+	joinOutput, joinCode := runCliWithFakeDaemon(t, fixture,
+		"room", "join", "safe-room", "--agent", "codex", "--name", "Codex")
+	if joinCode != 0 {
+		t.Fatalf("room join failed: %d %q", joinCode, joinOutput)
+	}
+	for _, output := range []string{createOutput, joinOutput} {
+		for _, private := range []string{
+			"participant-handle-private", "participant-token-private", "provider-handle-private",
+			"provider-claim-private", "provider-proof-private", "sfu-session-private", "internal-secret-private",
+			"participant-visible-but-unneeded", "{\"roomId\"",
+		} {
+			if strings.Contains(output, private) {
+				t.Fatalf("human-facing room output leaked %q: %q", private, output)
+			}
+		}
+	}
+}
+
+func TestTerminalSafeEscapesTerminalControls(t *testing.T) {
+	input := "safe\n\r\t\x00\x1b\x7f\u009b"
+	if got, want := terminalSafe(input), `safe\n\r\t\x00\x1b\x7f\x9b`; got != want {
+		t.Fatalf("terminal-safe output mismatch:\n got: %q\nwant: %q", got, want)
+	}
+	for _, runeValue := range terminalSafe(input) {
+		if unicode.IsControl(runeValue) {
+			t.Fatalf("terminal-safe output retained control rune %U", runeValue)
+		}
+	}
+}
+
+func TestRoomHumanOutputEscapesTerminalControls(t *testing.T) {
+	roomID := "safe\nFORGED\rROW\u009b2J"
+	name := "\x1b[31mPi\t"
+	createResult := json.RawMessage(`{
+  "invite":{"kind":"free4chat.room-invite","version":1,"roomId":"safe\nFORGED\rROW\u009b2J","roomUrl":"https://www.free4.chat/room?id=safe%0A\u001b]8;;https://attacker.example\u0007"}
+}`)
+	joinResult := json.RawMessage(`{"state":"waiting","roomId":"safe\nFORGED\rROW\u009b2J"}`)
+	fixture := roomFixture(t, createResult, joinResult)
+
+	createOutput, createCode := runCliWithFakeDaemon(t, fixture,
+		"room", "create", "--agent", "pi", "--name", name)
+	if createCode != 0 {
+		t.Fatalf("room create failed: %d %q", createCode, createOutput)
+	}
+	joinOutput, joinCode := runCliWithFakeDaemon(t, fixture,
+		"room", "join", roomID, "--agent", "codex", "--name", name)
+	if joinCode != 0 {
+		t.Fatalf("room join failed: %d %q", joinCode, joinOutput)
+	}
+
+	for _, output := range []string{createOutput, joinOutput} {
+		for _, runeValue := range []rune{'\x00', '\r', '\t', '\x1b', '\x7f', '\u009b'} {
+			if strings.ContainsRune(output, runeValue) {
+				t.Fatalf("human-facing room output retained control rune %U: %q", runeValue, output)
+			}
+		}
+		if strings.Contains(output, "safe\nFORGED") {
+			t.Fatalf("human-facing room output allowed a forged line: %q", output)
+		}
+	}
+	for _, expected := range []string{
+		"✓ \\x1b[31mPi\\t joined",
+		"Room: safe\\nFORGED\\rROW\\x9b2J",
+	} {
+		if !strings.Contains(createOutput, expected) || !strings.Contains(joinOutput, expected) {
+			t.Fatalf("room output omitted escaped public value %q:\ncreate: %q\njoin: %q", expected, createOutput, joinOutput)
+		}
+	}
+	if !strings.Contains(createOutput, "Human UI: https://www.free4.chat/room?id=safe%0A\\x1b]8;;https://attacker.example\\x07") {
+		t.Fatalf("room create did not escape the public Room URL: %q", createOutput)
+	}
+}
+
+func TestRoomCommandsKeepLegacyMachineReadableOutput(t *testing.T) {
+	createResult := json.RawMessage(`{"state":"waiting","roomId":"legacy-room","name":"Pi","instanceId":"instance-a","participantId":"participant-a","invite":{"kind":"free4chat.room-invite","version":1,"roomId":"legacy-room","roomUrl":"https://www.free4.chat/room?id=legacy-room"}}`)
+	joinResult := json.RawMessage(`{"state":"waiting","roomId":"legacy-room","name":"Codex","instanceId":"instance-b","participantId":"participant-b"}`)
+	fixture := roomFixture(t, createResult, joinResult)
+
+	for _, test := range []struct {
+		args     []string
+		expected json.RawMessage
+	}{
+		{[]string{"create", "--agent", "pi", "--name", "Pi"}, createResult},
+		{[]string{"join", "--room", "legacy-room", "--agent", "codex", "--name", "Codex"}, joinResult},
+	} {
+		output, code := runCliWithFakeDaemon(t, fixture, test.args...)
+		if code != 0 {
+			t.Fatalf("legacy %v failed: %d %q", test.args, code, output)
+		}
+		var got, want any
+		if err := json.Unmarshal([]byte(output), &got); err != nil {
+			t.Fatalf("legacy %v stopped returning JSON: %v (%q)", test.args, err, output)
+		}
+		if err := json.Unmarshal(test.expected, &want); err != nil {
+			t.Fatalf("bad expected fixture: %v", err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("legacy %v response changed:\n got: %#v\nwant: %#v", test.args, got, want)
+		}
+	}
+}
+
+func TestRoomRejectsInvalidCommandShapesAndMalformedDaemonOutput(t *testing.T) {
+	for _, args := range [][]string{
+		{"room"},
+		{"room", "create", "--room", "not-allowed", "--agent", "pi", "--name", "Pi"},
+		{"room", "join", "--room", "not-allowed", "--agent", "pi", "--name", "Pi"},
+		{"room", "join", "safe-room", "--room", "not-allowed", "--agent", "pi", "--name", "Pi"},
+		{"room", "join", "safe-room", "--name", "Pi"},
+		{"room", "unknown"},
+	} {
+		output, code := runCli(t, args...)
+		if code != 2 || !strings.Contains(output, "free4chat-agent room") {
+			t.Fatalf("room %v must usage-exit without a daemon request: code=%d output=%q", args, code, output)
+		}
+	}
+
+	fixture := roomFixture(t,
+		json.RawMessage(`{"participantHandle":"malformed-response-private"}`),
+		json.RawMessage(`{"participantHandle":"malformed-response-private"}`),
+	)
+	output, code := runCliWithFakeDaemon(t, fixture,
+		"room", "create", "--agent", "pi", "--name", "Pi")
+	if code != 1 || !strings.Contains(output, "omitted the public Room invite") ||
+		strings.Contains(output, "malformed-response-private") {
+		t.Fatalf("malformed create response must fail closed without echoing private fields: code=%d output=%q", code, output)
+	}
+}
+
+func TestUsageAndUnknownCommandsExitTwo(t *testing.T) {
+	if _, code := runCli(t); code != 2 {
+		t.Fatalf("bare invocation should exit 2")
+	}
+	if _, code := runCli(t, "teleport"); code != 2 {
+		t.Fatal("unknown command should exit 2")
+	}
+	if _, code := runCli(t, "peers"); code != 2 {
+		t.Fatal("peers without --room should exit 2")
+	}
+	if _, code := runCli(t, "join"); code != 2 {
+		t.Fatal("malformed join should exit 2")
+	}
+}
+
+func TestDoctorHumanAndJsonOutputs(t *testing.T) {
+	output, code := runCli(t, "doctor")
+	if code != 0 || !strings.Contains(output, "Launchers:") ||
+		!strings.Contains(output, "hermes") {
+		t.Fatalf("doctor text mismatch: %q", output)
+	}
+	jsonOutput, code := runCli(t, "doctor", "--json")
+	if code != 0 {
+		t.Fatalf("doctor --json failed: %q", jsonOutput)
+	}
+	var report struct {
+		Package   string `json:"package"`
+		Runtime   string `json:"runtime"`
+		Launchers []struct {
+			ID    string `json:"id"`
+			Ready bool   `json:"ready"`
+		} `json:"launchers"`
+	}
+	if err := json.Unmarshal([]byte(jsonOutput), &report); err != nil ||
+		report.Runtime != "go" ||
+		len(report.Launchers) == 0 || report.Launchers[0].ID != "hermes" {
+		t.Fatalf("doctor json mismatch: %q %v", jsonOutput, err)
+	}
+}
+
+func TestVersionReportsStableLocalMachineReadableValue(t *testing.T) {
+	jsonOutput, code := runCli(t, "version", "--json")
+	if code != 0 {
+		t.Fatalf("version --json failed: %q", jsonOutput)
+	}
+	var report struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal([]byte(jsonOutput), &report); err != nil {
+		t.Fatalf("version JSON parse failed: %v (%q)", err, jsonOutput)
+	}
+	if !regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`).MatchString(report.Version) {
+		t.Fatalf("version is not stable semantic version: %q", report.Version)
+	}
+	if strings.Contains(jsonOutput, "FREE4CHAT_AGENT_DIR") ||
+		strings.Contains(jsonOutput, "free4chat-agent-") {
+		t.Fatalf("version output leaked local details: %q", jsonOutput)
+	}
+
+	textOutput, code := runCli(t, "version")
+	if code != 0 || strings.TrimSpace(textOutput) != report.Version {
+		t.Fatalf("human version output mismatch: code=%d output=%q", code, textOutput)
+	}
+}
+
+func TestReadinessReportsGoRuntimeAndDeferredMedia(t *testing.T) {
+	output, code := runCli(t, "readiness", "--json")
+	if code != 0 {
+		t.Fatalf("readiness failed: %q", output)
+	}
+	var report struct {
+		Runtime struct {
+			Ready   bool   `json:"ready"`
+			Runtime string `json:"runtime"`
+		} `json:"runtime"`
+		Media struct {
+			Engine    string `json:"engine"`
+			Supported bool   `json:"supported"`
+			Ready     bool   `json:"ready"`
+		} `json:"media"`
+		Speech struct {
+			STT struct {
+				Provider   string `json:"provider"`
+				Configured bool   `json:"configured"`
+				Ready      bool   `json:"ready"`
+			} `json:"stt"`
+			TTS struct {
+				Provider   string `json:"provider"`
+				Configured bool   `json:"configured"`
+				Ready      bool   `json:"ready"`
+			} `json:"tts"`
+		} `json:"speech"`
+	}
+	if err := json.Unmarshal([]byte(output), &report); err != nil {
+		t.Fatalf("readiness parse failed: %v (%q)", err, output)
+	}
+	if !report.Runtime.Ready || report.Runtime.Runtime != "go" {
+		t.Fatalf("go runtime readiness wrong: %+v", report.Runtime)
+	}
+	// Media is real now (in-process Pion), but speech readiness must stay
+	// honest about the LOCAL provider configuration — never about a room
+	// grant (that is room state, checked by the controller at grant time).
+	if !report.Media.Supported || !report.Media.Ready || report.Media.Engine != "pion" {
+		t.Fatalf("in-process Pion media must be reported available: %+v", report.Media)
+	}
+	if report.Speech.STT.Provider != "doubao" || report.Speech.TTS.Provider != "doubao" {
+		t.Fatalf("doubao is the only production provider: %+v", report.Speech)
+	}
+	// No DOUBAO_API_KEY in the test environment: configuration must be
+	// reported false, and text readiness must still hold (it does — the
+	// report was produced at all).
+	if report.Speech.STT.Configured || report.Speech.STT.Ready {
+		t.Fatalf("STT must not claim readiness without a credential: %+v", report.Speech.STT)
+	}
+	if report.Speech.TTS.Configured || report.Speech.TTS.Ready {
+		t.Fatalf("TTS must not claim readiness without a credential: %+v", report.Speech.TTS)
+	}
+}
+
+func TestStatusPayloadShowsResidentAfterDaemonAutoStart(t *testing.T) {
+	// status/ensureDaemon spawns the detached daemon; then readiness --room
+	// projects not_joined for an unrelated room (bounded local state check).
+	output, code := runCli(t, "status")
+	if code != 0 || !strings.Contains(strings.TrimSpace(output), "[") {
+		t.Fatalf("status payload mismatch: %q", output)
+	}
+	roomView, code := runCli(t, "readiness", "--json", "--room", "unjoined-room")
+	_ = roomView
+	if code != 0 || !strings.Contains(roomView, `"reason": "not_joined"`) &&
+		!strings.Contains(roomView, `"reason":"not_joined"`) {
+		t.Fatalf("room readiness mismatch: %q", roomView)
+	}
+}
+
+func TestStatusCLIPrintsHarnessSessionDiagnostics(t *testing.T) {
+	fixture := newFakeDaemon(t, func(request daemon.IpcRequest) daemon.IpcResponse {
+		if request.Op != "status" {
+			return daemon.IpcResponse{OK: false, Error: "unexpected fake daemon operation"}
+		}
+		return daemon.IpcResponse{OK: true, Result: []any{
+			map[string]any{
+				"instanceId": "resident-status",
+				"harnessSessions": []map[string]any{
+					{"scope": "room", "sessionId": "room-session", "generation": 1},
+					{"scope": "task:T", "sessionId": "task-session", "generation": 1},
+				},
+			},
+		}}
+	})
+
+	output, code := runCliWithFakeDaemon(t, fixture, "status")
+	if code != 0 {
+		t.Fatalf("status exited %d: %q", code, output)
+	}
+	var residents []struct {
+		HarnessSessions []struct {
+			Scope      string `json:"scope"`
+			SessionID  string `json:"sessionId"`
+			Generation int64  `json:"generation"`
+		} `json:"harnessSessions"`
+	}
+	if err := json.Unmarshal([]byte(output), &residents); err != nil {
+		t.Fatalf("status output was not JSON: %v (%q)", err, output)
+	}
+	if len(residents) != 1 || len(residents[0].HarnessSessions) != 2 ||
+		residents[0].HarnessSessions[0].Scope != "room" ||
+		residents[0].HarnessSessions[0].SessionID != "room-session" ||
+		residents[0].HarnessSessions[1].Scope != "task:T" {
+		t.Fatalf("status CLI altered or omitted Harness session diagnostics: %q", output)
+	}
+}
+
+func TestRunViaDaemonRejectsStaleResidentBeforeJoin(t *testing.T) {
+	dir, err := os.MkdirTemp("", "fcagent-")
+	if err != nil {
+		t.Fatalf("temp dir failed: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	t.Setenv("FREE4CHAT_AGENT_DIR", dir)
+	listener, err := net.Listen("unix", daemon.SocketPath())
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	operations := make(chan string, 2)
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			func() {
+				defer conn.Close()
+				line, readErr := bufio.NewReader(conn).ReadString('\n')
+				if readErr != nil {
+					return
+				}
+				var request struct {
+					Op string `json:"op"`
+				}
+				if json.Unmarshal([]byte(strings.TrimSpace(line)), &request) != nil {
+					return
+				}
+				operations <- request.Op
+				response, marshalErr := json.Marshal(daemon.IpcResponse{
+					OK: true,
+					Result: daemon.DaemonInfo{
+						DaemonVersion: "0.5.3",
+					},
+				})
+				if marshalErr == nil {
+					_, _ = conn.Write(append(response, '\n'))
+				}
+			}()
+		}
+	}()
+
+	err = runViaDaemon(&daemon.IpcRequest{Op: "join"})
+	if err == nil || !strings.Contains(err.Error(), "does not match runtime "+doctor.Version) {
+		t.Fatalf("stale daemon must be rejected before room join, got %v", err)
+	}
+	select {
+	case operation := <-operations:
+		if operation != "daemon-info" {
+			t.Fatalf("first operation must be daemon-info, got %s", operation)
+		}
+	default:
+		t.Fatal("stale daemon did not receive the daemon-info probe")
+	}
+	select {
+	case operation := <-operations:
+		t.Fatalf("stale daemon received a room operation after rejection: %s", operation)
+	default:
+	}
+}
+
+func TestFormatCliErrorClassifier(t *testing.T) {
+	auth := formatCliError(errString("authentication required by harness"))
+	if !strings.Contains(auth, "Authenticate the selected Harness locally") {
+		t.Fatalf("auth hint missing: %q", auth)
+	}
+	long := formatCliError(errString(strings.Repeat("y", 500)))
+	if len(long) > 300 {
+		t.Fatalf("300-char cap violated: %d", len(long))
+	}
+	scrubbed := formatCliError(errString("http 500: authorization: Bearer tok123 api_key: pk456"))
+	if strings.Contains(scrubbed, "tok123") || strings.Contains(scrubbed, "pk456") {
+		t.Fatalf("credentials leaked through formatting: %q", scrubbed)
+	}
+	if !strings.Contains(scrubbed, "[REDACTED]") {
+		t.Fatalf("redaction marker missing: %q", scrubbed)
+	}
+	expired := formatCliError(errString(`{"error":"room_expired"}`))
+	if !strings.Contains(expired, "has expired") {
+		t.Fatalf("expiry hint missing: %q", expired)
+	}
+	spawnHint := formatCliError(errString("spawn opencode-acp failed"))
+	if !strings.Contains(spawnHint, "Harness launcher is unavailable") {
+		t.Fatalf("spawn hint missing: %q", spawnHint)
+	}
+	deadHarness := formatCliError(errString("ACP process exited (exit status 1)"))
+	if !strings.Contains(deadHarness, "The Harness ACP process stopped before joining") {
+		t.Fatalf("dead-harness hint missing: %q", deadHarness)
+	}
+	missing := formatCliError(errString("ACP session/new failed: Missing environment variable: CUSTOM_TEST_SETTING"))
+	if !strings.Contains(missing, "CUSTOM_TEST_SETTING") ||
+		!strings.Contains(missing, "--agent-env CUSTOM_TEST_SETTING") {
+		t.Fatalf("safe missing-env recovery hint missing: %q", missing)
+	}
+	if strings.Contains(missing, "=") || strings.Contains(missing, "value") {
+		t.Fatalf("missing-env hint must not expose a value: %q", missing)
+	}
+	reserved := formatCliError(errString("Missing environment variable: FREE4CHAT_AGENT_BIN"))
+	if strings.Contains(reserved, "--agent-env") {
+		t.Fatalf("reserved Runtime policy must not get an inheritance hint: %q", reserved)
+	}
+}
+
+func TestRoomReadinessSearchesAllHarnessResidents(t *testing.T) {
+	residents := func(firstAdapter, secondAdapter string) []map[string]any {
+		return []map[string]any{
+			{"roomId": "test-room", "instanceId": "resident-first", "participantId": "agent-first", "adapter": firstAdapter},
+			{"roomId": "test-room", "instanceId": "resident-second", "participantId": "agent-second", "adapter": secondAdapter},
+		}
+	}
+	for _, test := range []struct {
+		name            string
+		instances       []map[string]any
+		expected        string
+		joined          bool
+		wantInstance    string
+		wantParticipant string
+		wantReason      string
+	}{
+		{
+			name: "matching resident follows opencode", instances: residents("opencode", "codex"),
+			expected: "codex", joined: true, wantInstance: "resident-second", wantParticipant: "agent-second",
+		},
+		{
+			name: "matching resident precedes opencode", instances: residents("codex", "opencode"),
+			expected: "codex", joined: true, wantInstance: "resident-first", wantParticipant: "agent-first",
+		},
+		{
+			name: "no matching resident", instances: residents("opencode", "pi"),
+			expected: "codex", wantReason: "harness_mismatch",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result := roomReadiness("test-room", test.instances, test.expected)
+			if result["joined"] != test.joined {
+				t.Fatalf("readiness result changed with resident order: %#v", result)
+			}
+			if test.joined {
+				if result["adapter"] != "codex" || result["instanceId"] != test.wantInstance ||
+					result["participantId"] != test.wantParticipant {
+					t.Fatalf("readiness did not select the matching codex resident: %#v", result)
+				}
+				return
+			}
+			if result["reason"] != test.wantReason || result["expectedAdapter"] != "codex" {
+				t.Fatalf("readiness mismatch result changed with resident order: %#v", result)
+			}
+			if !reflect.DeepEqual(result["actualAdapters"], []string{"opencode", "pi"}) {
+				t.Fatalf("mismatch adapter diagnostics were not deterministic: %#v", result)
+			}
+		})
+	}
+}
+
+type errString string
+
+func (e errString) Error() string { return string(e) }
+
+// agentEnvFixture is a fake daemon that answers the standard join/create
+// preflight handshakes and the join/create operation itself.
+func agentEnvFixture(t *testing.T, result map[string]any) *fakeDaemon {
+	t.Helper()
+	return newFakeDaemon(t, func(request daemon.IpcRequest) daemon.IpcResponse {
+		switch request.Op {
+		case "status":
+			return daemon.IpcResponse{OK: true, Result: []any{}}
+		case "daemon-info":
+			return daemon.IpcResponse{OK: true, Result: daemon.DaemonInfo{DaemonVersion: doctor.Version}}
+		case "join":
+			return daemon.IpcResponse{OK: true, Result: result}
+		case "create":
+			// The room create human-facing printer requires the public invite.
+			return daemon.IpcResponse{OK: true, Result: map[string]any{
+				"roomId": "test-room",
+				"invite": map[string]any{
+					"kind":    "free4chat.room-invite",
+					"version": 1,
+					"roomId":  "test-room",
+					"roomUrl": "https://www.free4.chat/room?id=test-room",
+				},
+			}}
+		default:
+			return daemon.IpcResponse{OK: false, Error: "unexpected fake daemon operation " + request.Op}
+		}
+	})
+}
+
+// nextFakeRequestOp drains preflight handshakes until the requested operation
+// arrives. join goes through daemon-info/version; create goes through
+// EnsureDaemon/status. Hard-coding the exact preflight sequence per command is
+// the source of earlier failures, so tests wait for the actual operation
+// instead of assuming a fixed request order.
+func nextFakeRequestOp(t *testing.T, fixture *fakeDaemon, op string) daemon.IpcRequest {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case request := <-fixture.requests:
+			if request.Op == op {
+				return request
+			}
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	t.Fatalf("timed out waiting for fake daemon operation %q", op)
+	return daemon.IpcRequest{}
+}
+
+// TestAgentEnvParsing validates the --agent-env CLI flag parsing contract:
+// repeatable names are resolved from the CURRENT CLI environment and reach
+// the daemon IPC request.
+func TestAgentEnvParsing(t *testing.T) {
+	fixture := agentEnvFixture(t, map[string]any{"roomId": "test-room"})
+	_ = os.Setenv("CUSTOM_VAR1", "value1")
+	_ = os.Setenv("CUSTOM_VAR2", "value2")
+	defer os.Unsetenv("CUSTOM_VAR1")
+	defer os.Unsetenv("CUSTOM_VAR2")
+
+	output, code := runCliWithFakeDaemon(t, fixture,
+		"join", "--room", "test-room",
+		"--agent", "opencode",
+		"--name", "Test",
+		"--agent-env", "CUSTOM_VAR1",
+		"--agent-env", "CUSTOM_VAR2",
+	)
+	if code != 0 {
+		t.Fatalf("multiple --agent-env should succeed, got %d (%s)", code, output)
+	}
+	request := nextFakeRequestOp(t, fixture, "join")
+	if len(request.AgentEnv) != 2 {
+		t.Fatalf("AgentEnv should carry both names, got %v", request.AgentEnv)
+	}
+	if request.AgentEnv["CUSTOM_VAR1"] != "value1" || request.AgentEnv["CUSTOM_VAR2"] != "value2" {
+		t.Fatalf("AgentEnv values should be populated from current shell: %v", request.AgentEnv)
+	}
+}
+
+// TestAgentEnvMissingFailsBeforeJoin ensures a requested NAME that is absent
+// from the CURRENT CLI environment fails locally before any daemon operation.
+func TestAgentEnvMissingFailsBeforeJoin(t *testing.T) {
+	_ = os.Unsetenv("MISSING_VAR_FOR_TEST_276")
+	output, code := runCli(t,
+		"join", "--room", "test-room",
+		"--agent", "opencode",
+		"--name", "Test",
+		"--agent-env", "MISSING_VAR_FOR_TEST_276",
+	)
+	if code == 0 {
+		t.Fatalf("missing --agent-env should fail before daemon join")
+	}
+	if !strings.Contains(output, "MISSING_VAR_FOR_TEST_276") ||
+		!strings.Contains(output, "not set locally") {
+		t.Fatalf("error should mention the variable name only: %s", output)
+	}
+}
+
+// TestAgentEnvInvalidNameRejected validates environment variable name grammar
+// and the explicit rejection of NAME=value syntax.
+func TestAgentEnvInvalidNameRejected(t *testing.T) {
+	for _, invalid := range []string{
+		"123INVALID",   // starts with digit
+		"INVALID-NAME", // contains hyphen
+		"INVALID.NAME", // contains dot
+		"",             // empty
+	} {
+		output, code := runCli(t,
+			"join", "--room", "test-room",
+			"--agent", "opencode",
+			"--name", "Test",
+			"--agent-env", invalid,
+		)
+		if code == 0 {
+			t.Fatalf("invalid name %q should be rejected", invalid)
+		}
+		if !strings.Contains(output, "invalid environment variable name") {
+			t.Fatalf("error should mention invalid name for %q: %s", invalid, output)
+		}
+	}
+
+	// NAME=value syntax is forbidden with its own message.
+	output, code := runCli(t,
+		"join", "--room", "test-room",
+		"--agent", "opencode",
+		"--name", "Test",
+		"--agent-env", "SOME_KEY=secret-value",
+	)
+	if code == 0 {
+		t.Fatal("NAME=value --agent-env syntax should be rejected")
+	}
+	if !strings.Contains(output, "--agent-env takes a variable NAME only, not NAME=value") {
+		t.Fatalf("NAME=value error message missing: %s", output)
+	}
+}
+
+// TestAgentEnvMissingValueRejected ensures a bare --agent-env with no
+// following NAME fails cleanly.
+func TestAgentEnvMissingValueRejected(t *testing.T) {
+	for _, args := range [][]string{
+		{"join", "--room", "test-room", "--agent", "opencode", "--name", "Test", "--agent-env"},
+		{"join", "--room", "test-room", "--agent", "opencode", "--name", "Test", "--agent-env", "--capability", "x"},
+	} {
+		output, code := runCli(t, args...)
+		if code == 0 || !strings.Contains(output, "--agent-env requires a variable NAME") {
+			t.Fatalf("%v must fail with the missing-NAME error, got code=%d output=%q", args, code, output)
+		}
+	}
+}
+
+// TestAgentEnvReservedNamesRejected validates Free4Chat-owned lifecycle and
+// security variables are rejected at the CLI.
+func TestAgentEnvReservedNamesRejected(t *testing.T) {
+	for _, reserved := range []string{
+		"CODEX_CONFIG",
+		"INITIAL_AGENT_MODE",
+		"FREE4CHAT_API_KEY",
+		"FREE4CHAT_SOME_SETTING",
+		"FREE4CHAT_AGENT_DIR",
+	} {
+		output, code := runCli(t,
+			"join", "--room", "test-room",
+			"--agent", "opencode",
+			"--name", "Test",
+			"--agent-env", reserved,
+		)
+		if code == 0 {
+			t.Fatalf("reserved name %q should be rejected", reserved)
+		}
+		if !strings.Contains(output, "reserved by Free4Chat") ||
+			strings.Contains(output, "=") {
+			t.Fatalf("reserved error should be name-only for %q: %s", reserved, output)
+		}
+	}
+}
+
+// TestAgentEnvBoundsEnforced validates count and total value size bounds.
+func TestAgentEnvBoundsEnforced(t *testing.T) {
+	many := make([]string, 0, agentEnvMaxCount+2)
+	for i := 0; i < agentEnvMaxCount+2; i++ {
+		many = append(many, "--agent-env", fmt.Sprintf("VAR%d", i))
+		_ = os.Setenv(fmt.Sprintf("VAR%d", i), "value")
+	}
+	defer func() {
+		for i := 0; i < agentEnvMaxCount+2; i++ {
+			_ = os.Unsetenv(fmt.Sprintf("VAR%d", i))
+		}
+	}()
+	args := append([]string{"join", "--room", "test-room", "--agent", "opencode", "--name", "Test"}, many...)
+	output, code := runCli(t, args...)
+	if code == 0 {
+		t.Fatalf("too many --agent-env should fail")
+	}
+	if !strings.Contains(output, "too many --agent-env entries") {
+		t.Fatalf("error should mention count limit: %s", output)
+	}
+
+	largeVal := strings.Repeat("x", agentEnvMaxTotalBytes+1)
+	_ = os.Setenv("LARGE_VAR_TEST", largeVal)
+	defer os.Unsetenv("LARGE_VAR_TEST")
+	output, code = runCli(t,
+		"join", "--room", "test-room",
+		"--agent", "opencode",
+		"--name", "Test",
+		"--agent-env", "LARGE_VAR_TEST",
+	)
+	if code == 0 {
+		t.Fatalf("over-size --agent-env value should fail")
+	}
+	if !strings.Contains(output, "exceeds") && !strings.Contains(output, "bytes") {
+		t.Fatalf("error should mention size limit: %s", output)
+	}
+}
+
+// TestAgentEnvWorksOnAllEntryPaths validates --agent-env on create, join,
+// room create, and room join.
+func TestAgentEnvWorksOnAllEntryPaths(t *testing.T) {
+	fixture := agentEnvFixture(t, map[string]any{"roomId": "test-room"})
+	_ = os.Setenv("TEST_VAR_ENTRY", "entry-value")
+	defer os.Unsetenv("TEST_VAR_ENTRY")
+
+	for _, cmd := range [][]string{
+		{"create", "--agent", "opencode", "--name", "Test", "--agent-env", "TEST_VAR_ENTRY"},
+		{"join", "--room", "test-room", "--agent", "opencode", "--name", "Test", "--agent-env", "TEST_VAR_ENTRY"},
+		{"room", "create", "--agent", "opencode", "--name", "Test", "--agent-env", "TEST_VAR_ENTRY"},
+		{"room", "join", "test-room", "--agent", "opencode", "--name", "Test", "--agent-env", "TEST_VAR_ENTRY"},
+	} {
+		output, code := runCliWithFakeDaemon(t, fixture, cmd...)
+		if code != 0 {
+			t.Fatalf("--agent-env should work on %v: %d %s", cmd, code, output)
+		}
+		op := "create"
+		if cmd[0] == "join" || (cmd[0] == "room" && cmd[1] == "join") {
+			op = "join"
+		}
+		request := nextFakeRequestOp(t, fixture, op)
+		if request.AgentEnv == nil || request.AgentEnv["TEST_VAR_ENTRY"] != "entry-value" {
+			t.Fatalf("AgentEnv not passed for %v: %v", cmd, request.AgentEnv)
+		}
+	}
+}
+
+// TestAgentEnvDeduplication validates deterministic duplicate handling: first
+// occurrence wins and the map holds exactly one entry.
+func TestAgentEnvDeduplication(t *testing.T) {
+	fixture := agentEnvFixture(t, map[string]any{"roomId": "test-room"})
+	_ = os.Setenv("DUP_VAR_TEST", "first-value")
+	defer os.Unsetenv("DUP_VAR_TEST")
+
+	output, code := runCliWithFakeDaemon(t, fixture,
+		"join", "--room", "test-room",
+		"--agent", "opencode",
+		"--name", "Test",
+		"--agent-env", "DUP_VAR_TEST",
+		"--agent-env", "DUP_VAR_TEST",
+	)
+	if code != 0 {
+		t.Fatalf("duplicate --agent-env should not fail, got %d (%s)", code, output)
+	}
+	request := nextFakeRequestOp(t, fixture, "join")
+	if len(request.AgentEnv) != 1 || request.AgentEnv["DUP_VAR_TEST"] != "first-value" {
+		t.Fatalf("duplicate should be deduplicated (first wins): %v", request.AgentEnv)
+	}
+}
+
+// TestAgentEnvStaleDaemonRegression proves the CLI resolves values from its
+// own CURRENT environment: a value set after the daemon might have started
+// still reaches the IPC request, and the daemon never gets a chance to use an
+// older ambient copy for an explicitly inherited name.
+func TestAgentEnvStaleDaemonRegression(t *testing.T) {
+	fixture := agentEnvFixture(t, map[string]any{"roomId": "test-room"})
+
+	// Simulate the stale-daemon setup: a value that existed "before" the CLI
+	// invocation. The explicit request must carry the CURRENT value.
+	_ = os.Setenv("STALE_TEST_VAR", "current-shell-value")
+	defer os.Unsetenv("STALE_TEST_VAR")
+
+	output, code := runCliWithFakeDaemon(t, fixture,
+		"join", "--room", "test-room",
+		"--agent", "opencode",
+		"--name", "Test",
+		"--agent-env", "STALE_TEST_VAR",
+	)
+	if code != 0 {
+		t.Fatalf("stale daemon regression CLI run failed: %d (%s)", code, output)
+	}
+	request := nextFakeRequestOp(t, fixture, "join")
+	if request.AgentEnv["STALE_TEST_VAR"] != "current-shell-value" {
+		t.Fatalf("current shell value should be carried over IPC, got %q", request.AgentEnv["STALE_TEST_VAR"])
+	}
+}
+
+// TestAgentEnvWorksWithCustomLauncher validates --agent-env works with the
+// --agent-command custom launcher path.
+func TestAgentEnvWorksWithCustomLauncher(t *testing.T) {
+	fixture := agentEnvFixture(t, map[string]any{"roomId": "test-room"})
+	_ = os.Setenv("CUSTOM_LAUNCHER_VAR", "custom-value")
+	defer os.Unsetenv("CUSTOM_LAUNCHER_VAR")
+
+	output, code := runCliWithFakeDaemon(t, fixture,
+		"join", "--room", "test-room",
+		"--agent-command", "custom-acp",
+		"--name", "Test",
+		"--agent-env", "CUSTOM_LAUNCHER_VAR",
+	)
+	if code != 0 {
+		t.Fatalf("--agent-env should work with --agent-command, got %d (%s)", code, output)
+	}
+	request := nextFakeRequestOp(t, fixture, "join")
+	if request.AgentEnv == nil || request.AgentEnv["CUSTOM_LAUNCHER_VAR"] != "custom-value" {
+		t.Fatalf("AgentEnv not passed with custom launcher: %v", request.AgentEnv)
+	}
+}

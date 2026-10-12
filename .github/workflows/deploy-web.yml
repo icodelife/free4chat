@@ -1,0 +1,173 @@
+name: CI / Deploy
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "app/**"
+      - "docs/**"
+      - ".github/workflows/deploy-web.yml"
+  pull_request:
+    paths:
+      - "app/**"
+      - "docs/**"
+      - ".github/workflows/deploy-web.yml"
+
+jobs:
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: app/.nvmrc
+          cache: yarn
+          cache-dependency-path: app/yarn.lock
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+        working-directory: app
+
+      - name: Prettier
+        run: npx prettier --check .
+        working-directory: app
+
+      - name: ESLint
+        run: yarn lint --max-warnings 0
+        working-directory: app
+
+      - name: Type check
+        run: yarn type-check
+        working-directory: app
+
+      # Fails when app/public/llms*.txt or app/public/sitemap.xml drifted
+      # from docs/en/navigation.json + docs/en Markdown + the machine
+      # contracts; keeps docs URLs covered without running the test suite.
+      - name: Docs assets are fresh
+        run: yarn docs:check
+        working-directory: app
+
+      # The docs contract suite: navigation<->Markdown parity (an
+      # unregistered docs page fails here), route/props generation,
+      # path-traversal fail-closed, sitemap/llms coverage, and the rest of
+      # the crawl surface. Focused on purpose - the full vitest suite is
+      # not part of this workflow.
+      - name: Docs contract tests
+        run: npx vitest run src/__tests__/docs src/__tests__/discovery/crawl-surface.test.ts
+        working-directory: app
+
+  app-tests:
+    name: App Tests
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: app/.nvmrc
+          cache: yarn
+          cache-dependency-path: app/yarn.lock
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+        working-directory: app
+
+      - name: Full App test suite
+        run: yarn test
+        working-directory: app
+
+  deploy:
+    name: Build & Deploy
+    needs: [lint, app-tests]
+    if: >-
+      github.ref == 'refs/heads/cf-sfu' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: cf-sfu-deploy
+      cancel-in-progress: true
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: app/.nvmrc
+          cache: yarn
+          cache-dependency-path: app/yarn.lock
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+        working-directory: app
+
+      - name: Build
+        run: yarn cf-build
+        working-directory: app
+        env:
+          NEXT_PUBLIC_TURNSTILE_SITE_KEY: ${{ secrets.NEXT_PUBLIC_TURNSTILE_SITE_KEY }}
+          # Keep browser dogfood unblocked while Agent Voice is stabilised.
+          # Re-enable this together with TURNSTILE_DISABLED below once the
+          # production test window is explicitly closed.
+          NEXT_PUBLIC_TURNSTILE_DISABLED: "1"
+
+      # Copy prerendered pages (the /docs routes) into the Workers static
+      # assets bundle. The deploy job bypasses `opennextjs-cloudflare deploy`
+      # (raw `wrangler deploy` below), so the build's cache population must
+      # run explicitly. Local target = plain fs copy, no credentials needed.
+      - name: Populate static assets cache
+        run: npx opennextjs-cloudflare populateCache local
+        working-directory: app
+
+      - name: Validate deployment variables
+        run: test -n "$SFU_APP_ID" && test -n "$NEXT_PUBLIC_TURNSTILE_SITE_KEY"
+        env:
+          SFU_APP_ID: ${{ secrets.SFU_APP_ID }}
+          NEXT_PUBLIC_TURNSTILE_SITE_KEY: ${{ secrets.NEXT_PUBLIC_TURNSTILE_SITE_KEY }}
+
+      # Second, independent guard against a stale deploy (the concurrency
+      # group above should normally prevent this by cancelling an
+      # in-progress older run, but this check covers any window where an
+      # older run's Deploy step is reached anyway). "Stale" means cf-sfu
+      # now has a commit that itself touches app/, docs/, or this workflow
+      # file — see check-deploy-freshness.sh for why raw SHA equality
+      # against cf-sfu's tip is wrong under this workflow's path-filtered
+      # push trigger (a commit touching only non-deploy-relevant files,
+      # e.g. the root README, must NOT mark an in-flight app deploy
+      # stale). `set -euo pipefail` here means a fetch/resolution failure
+      # fails this step (and the job) visibly — it must never be silently
+      # treated as "stale, skip deploy, job green". No extra token needed:
+      # actions/checkout persists credentials for the job by default, so
+      # `git fetch origin` works.
+      - name: Verify this commit is still the latest deploy-relevant cf-sfu push
+        id: freshness
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin cf-sfu
+          latest_sha="$(git rev-parse --verify FETCH_HEAD)"
+          echo "Building commit: $GITHUB_SHA"
+          echo "Latest cf-sfu:    $latest_sha"
+          result="$(.github/scripts/check-deploy-freshness.sh "$GITHUB_SHA" "$latest_sha")"
+          echo "$result" >> "$GITHUB_OUTPUT"
+          if [ "$result" = "stale=true" ]; then
+            echo "::notice::Skipping deploy — cf-sfu has a newer commit ($latest_sha) that touches app/ or this workflow file. That commit's own run will (or already did) cover this push."
+          fi
+
+      - name: Deploy
+        if: steps.freshness.outputs.stale != 'true'
+        run: |
+          npx wrangler deploy \
+            --var "SFU_APP_ID:${SFU_APP_ID}" \
+            --var "AGENT_MEDIA_ENABLED:true" \
+            --var "TURNSTILE_DISABLED:true"
+        working-directory: app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SFU_APP_ID: ${{ secrets.SFU_APP_ID }}

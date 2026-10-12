@@ -1,0 +1,1525 @@
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react"
+
+import { useRouter } from "next/router"
+
+import { LOCAL_PEER_ID } from "@common/consts"
+import { MAX_COLLAB_SUMMARY_LENGTH } from "@do/collab"
+
+import RoomAppHost from "./RoomAppHost"
+import TextChatCard from "./TextChatCard"
+import UserCard from "./UserCard"
+import {
+  buildRoomInviteUrl,
+  experimentalRoomAppCatalog,
+  isRoomAppAllowlisted,
+  resolveProductionRoomAppId,
+  ROOM_APP_MAX_INSTANCES,
+  projectRoomAppParticipants,
+  roomAppInstanceId,
+  validateRoomAppDefinition,
+} from "../common/roomApp"
+import {
+  buildTaskProjections,
+  isTaskTerminal,
+  roomMessagesForView,
+  taskHasConnectedAgent,
+  type TaskProjection,
+} from "../common/taskViews"
+import type { UserInfo } from "../common/types"
+import {
+  umamiEvent,
+  trackAnalyticsEvent,
+  hashRoom,
+  participantsBucket,
+} from "../common/utils"
+import { useSfuChatRoom } from "../hooks/useSfuChatRoom"
+import { useTurnstile } from "../hooks/useTurnstile"
+
+const MAX_FILE_SIZE = 20 * 1024 * 1024
+
+type TaskAgent = { peerId: string; name: string }
+
+function taskIsUnavailable(
+  task: Pick<TaskProjection, "participatingAgentIds" | "status">,
+  participants: Pick<UserInfo, "peerId" | "kind">[]
+): boolean {
+  return (
+    !isTaskTerminal(task.status) && !taskHasConnectedAgent(task, participants)
+  )
+}
+
+function ScreenShareViewer({
+  stream,
+  name,
+}: {
+  stream: MediaStream
+  name: string
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null)
+
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.srcObject = stream
+  }, [stream])
+
+  const enterFullscreen = () => {
+    const v = videoRef.current
+    if (!v) return
+    if (v.requestFullscreen) v.requestFullscreen()
+    else if ((v as any).webkitEnterFullscreen)
+      (v as any).webkitEnterFullscreen()
+  }
+
+  return (
+    <div className="relative min-h-0 flex-1 bg-black">
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted
+        className="h-full w-full object-contain"
+      />
+      <div className="absolute bottom-2 left-2 rounded bg-black/60 px-2 py-0.5 text-xs text-white">
+        {name}
+      </div>
+      <button
+        className="absolute bottom-2 right-2 rounded bg-black/60 p-1 text-white hover:bg-black/80"
+        onClick={enterFullscreen}
+        title="全屏"
+      >
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          width="14"
+          height="14"
+          fill="none"
+          viewBox="0 0 24 24"
+          stroke="currentColor"
+          strokeWidth="2"
+        >
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5v-4m0 4h-4m4 0l-5-5"
+          />
+        </svg>
+      </button>
+    </div>
+  )
+}
+
+export default function RoomContent({
+  roomName,
+  nickName,
+  roomType,
+  initialRoomAppId,
+}: {
+  roomName: string
+  nickName: string
+  roomType: "audio" | "screenshare"
+  initialRoomAppId?: string
+}) {
+  const router = useRouter()
+  const [roomLinkCopied, setRoomLinkCopied] = useState(false)
+  const [runtimeConnectError, setRuntimeConnectError] = useState("")
+  const [taskAgent, setTaskAgent] = useState<TaskAgent | null>(null)
+  const [taskInstruction, setTaskInstruction] = useState("")
+  const [taskError, setTaskError] = useState("")
+  const [activeInteraction, setActiveInteraction] = useState("room")
+  const [activeRoomAppId, setActiveRoomAppId] = useState<string | null>(null)
+  const [expandedRoomAppId, setExpandedRoomAppId] = useState<string | null>(
+    null
+  )
+  // Browser-local resident App sessions, bounded by the curated catalog size.
+  const [launchedRoomAppIds, setLaunchedRoomAppIds] = useState<string[]>([])
+  const [readyRoomAppIds, setReadyRoomAppIds] = useState<string[]>([])
+  const initialRoomAppLaunchAttemptedRef = useRef(false)
+  const whiteboardSharedSessionTrackedRef = useRef(false)
+  const [stageView, setStageView] = useState<"screen" | "live-view">("screen")
+  const taskLiveViewState = useRef(new Map())
+  const observedLiveViewKeys = useRef(new Set<string>())
+  const interactedLiveViewKeys = useRef(new Set<string>())
+  const pendingLocalTaskSummaries = useRef<string[]>([])
+  const autoOpenedTaskIds = useRef<Set<string>>(new Set())
+  // #236 follow-up: shared popover state so the Live Transcript setup copy
+  // can cross-open the Invite Agent popover (no routing machinery).
+  const [agentInviteOpen, setAgentInviteOpen] = useState(false)
+  const [pendingFiles, setPendingFiles] = useState<
+    {
+      id: string
+      fileName: string
+      isImage: boolean
+      error?: boolean
+      errorMessage?: string
+    }[]
+  >([])
+  const [floatingReactions, setFloatingReactions] = useState<
+    { id: number; emoji: string; x: number }[]
+  >([])
+  const processedReactionIds = useRef<Set<string>>(new Set())
+  const joinedAtTs = useRef(Date.now().toString())
+
+  const spawnReaction = useCallback((emoji: string) => {
+    const id = Date.now() + Math.random()
+    const x = 10 + Math.random() * 80
+    setFloatingReactions((prev) => [...prev, { id, emoji, x }])
+    setTimeout(
+      () => setFloatingReactions((prev) => prev.filter((r) => r.id !== id)),
+      2500
+    )
+  }, [])
+
+  const { containerRef: turnstileContainerRef, requestToken } = useTurnstile()
+
+  const {
+    participants,
+    getLocalRoomAuth,
+    messages,
+    attachments,
+    taskLiveViews,
+    sendTextMessage,
+    sendFileMessage,
+    sendTaskAttachment,
+    sendActionMessage,
+    sendCollabRequest,
+    sendCollabResponse,
+    readRoomAttachment,
+    sendCollabResult,
+    sendPermissionResponse,
+    muteSelf,
+    toggleScreenShare,
+    retryVerification,
+    error,
+    connectionStatus,
+    resolvedRoomType,
+    liveTranscript,
+    liveTranscriptSegments,
+    runtimeHosts,
+    runtimeHostProviders,
+    liveTranscriptMediaAvailable,
+    startLiveTranscript,
+    stopLiveTranscript,
+    agentVoiceMediaAvailable,
+    setAgentVoice,
+    connectLocalRuntime,
+    runtimeConnectionStatus,
+    leaveRoom,
+    localParticipantId,
+    agentActivities,
+    roomAppsEnabled,
+    sendRoomAppMessage,
+    subscribeRoomAppMessages,
+    sendRoomAppUnicast,
+    subscribeRoomAppUnicast,
+    subscribeRoomAppUnicastResults,
+  } = useSfuChatRoom(roomName, nickName, roomType, {
+    getTurnstileToken: requestToken,
+  })
+
+  const taskProjections = useMemo(
+    () => buildTaskProjections(messages),
+    [messages]
+  )
+  const effectiveLocalParticipantId =
+    localParticipantId ?? getLocalRoomAuth()?.participantId
+  // The validated curated catalog is stable while the Room content is mounted.
+  // `roomAppsEnabled` is not a pure catalog/kill-switch signal: it also drops
+  // while an ordinary SFU/media reconnect rebuilds the App DataChannels, and
+  // that transient false must never be mistaken for a catalog removal.
+  const curatedRoomApps = useMemo(
+    () =>
+      experimentalRoomAppCatalog().filter(
+        (app) => validateRoomAppDefinition(app) && isRoomAppAllowlisted(app)
+      ),
+    []
+  )
+  const roomApps = roomAppsEnabled ? curatedRoomApps : []
+  // Conversation scope and visual Stage are independent selections: an active
+  // Room App lives on the Stage and never replaces the Room/Task conversation.
+  const activeRoomApp = roomApps.find((app) => activeRoomAppId === app.id)
+  const roomAppParticipants = projectRoomAppParticipants(
+    participants.map((participant) => ({
+      participantId:
+        participant.peerId === LOCAL_PEER_ID
+          ? effectiveLocalParticipantId ?? ""
+          : participant.peerId,
+      name: participant.name,
+      kind: participant.kind,
+    }))
+  )
+  const roomAppSelf = roomAppParticipants.find(
+    (participant) => participant.participantId === effectiveLocalParticipantId
+  )
+  // Hosts are mounted on first launch and then stay resident for this browser's
+  // Room session: Stage navigation only changes which one is visible, so an App
+  // never loses its iframe/MessagePort/App-local state to visual navigation.
+  // Resident resolution uses the stable curated catalog, not the transient
+  // transport-readiness flag.
+  const residentRoomApps = useMemo(
+    () =>
+      launchedRoomAppIds.flatMap((id) => {
+        const app = curatedRoomApps.find((candidate) => candidate.id === id)
+        return app ? [app] : []
+      }),
+    [curatedRoomApps, launchedRoomAppIds]
+  )
+  const humanParticipantCount = roomAppParticipants.filter(
+    (participant) => participant.kind === "human"
+  ).length
+  const whiteboardResident = residentRoomApps.some(
+    (app) => app.id === "whiteboard"
+  )
+  const whiteboardReady = readyRoomAppIds.includes("whiteboard")
+  const visibleRoomApp =
+    activeRoomApp && roomAppSelf ? activeRoomApp : undefined
+  // Focus mode is a Room layout state, not just a larger host. The resident
+  // host remains in its Stage subtree; all surrounding Room UI is made inert
+  // and removed from layout so nested stacking contexts cannot paint over or
+  // intercept input from the fixed host.
+  const isRoomAppFullscreen = Boolean(
+    roomAppSelf &&
+      expandedRoomAppId &&
+      expandedRoomAppId === activeRoomAppId &&
+      residentRoomApps.some((app) => app.id === expandedRoomAppId)
+  )
+  const activeTask = taskProjections.find(
+    (task) => task.requestId === activeInteraction
+  )
+  const activeTaskLiveView = activeTask
+    ? taskLiveViews?.[activeTask.requestId]
+    : undefined
+  const handleLiveViewVisible = useCallback(
+    (taskRequestId: string, surfaceId: string) => {
+      const key = `${taskRequestId}:${surfaceId}`
+      if (observedLiveViewKeys.current.has(key)) return
+      observedLiveViewKeys.current.add(key)
+      trackAnalyticsEvent("LiveViewVisible")
+    },
+    []
+  )
+  const handleLiveViewInteracted = useCallback(
+    (taskRequestId: string, surfaceId: string) => {
+      const key = `${taskRequestId}:${surfaceId}`
+      if (interactedLiveViewKeys.current.has(key)) return
+      interactedLiveViewKeys.current.add(key)
+      trackAnalyticsEvent("LiveViewInteracted")
+    },
+    []
+  )
+  const interactionMessages = activeTask
+    ? activeTask.messages
+    : roomMessagesForView(messages)
+  const referencedAttachmentIds = new Set(
+    interactionMessages.flatMap(
+      (message) => message.collab?.attachmentIds ?? []
+    )
+  )
+  const roomAttachments = attachments ?? []
+  const interactionAttachments = activeTask
+    ? roomAttachments.filter(
+        (attachment) =>
+          attachment.taskRequestId === activeTask.requestId &&
+          !referencedAttachmentIds.has(attachment.id)
+      )
+    : roomAttachments.filter(
+        (attachment) =>
+          attachment.taskRequestId === undefined &&
+          !referencedAttachmentIds.has(attachment.id)
+      )
+  const activeTaskActivities = activeTask
+    ? (agentActivities ?? []).filter(
+        (activity) =>
+          activity.scopeId === `task:${activeTask.requestId}` &&
+          participants.some(
+            (participant) =>
+              participant.peerId === activity.agentParticipantId &&
+              participant.kind === "agent"
+          )
+      )
+    : []
+  const activeTaskUnavailable = Boolean(
+    activeTask && taskIsUnavailable(activeTask, participants)
+  )
+
+  useEffect(() => {
+    const pending = pendingLocalTaskSummaries.current
+    const created =
+      effectiveLocalParticipantId && pending.length > 0
+        ? taskProjections.find(
+            (task) =>
+              task.createdByParticipantId === effectiveLocalParticipantId &&
+              pending.includes(task.title)
+          )
+        : undefined
+    if (created) {
+      pending.splice(pending.indexOf(created.title), 1)
+      autoOpenedTaskIds.current.add(created.requestId)
+      setActiveInteraction(created.requestId)
+      return
+    }
+
+    // Preserve the existing Human-facing collaboration controls: an incoming
+    // request addressed to this Human opens its task view so Accept/Decline
+    // remains visible, while unrelated task views stay behind the switcher.
+    if (activeInteraction !== "room" || !effectiveLocalParticipantId) return
+    const incoming = taskProjections.find(
+      (task) =>
+        task.targetParticipantId === effectiveLocalParticipantId &&
+        !autoOpenedTaskIds.current.has(task.requestId)
+    )
+    if (incoming) {
+      autoOpenedTaskIds.current.add(incoming.requestId)
+      setActiveInteraction(incoming.requestId)
+    }
+  }, [activeInteraction, effectiveLocalParticipantId, taskProjections])
+
+  useEffect(() => {
+    // A conversation scope is only ever "room" or a known Task. The Stage
+    // selection (screen share, Live View, Room App) is stored separately.
+    if (
+      activeInteraction !== "room" &&
+      !taskProjections.some((task) => task.requestId === activeInteraction)
+    )
+      setActiveInteraction("room")
+  }, [activeInteraction, taskProjections])
+
+  useEffect(() => {
+    // Resident hosts survive presentation changes and ordinary transport
+    // reconnects; they are torn down only when Room Apps are stably unavailable
+    // (the Room is connected/failed and the flag is still off, which covers
+    // ROOM_APPS_ENABLED being turned off) or when the curated catalog truly no
+    // longer offers the entry. Unmounting the Room closes them as well.
+    const stablyUnavailable =
+      !roomAppsEnabled &&
+      (connectionStatus === "connected" || connectionStatus === "failed")
+    const hostIsGone = (id: string) =>
+      stablyUnavailable || !curatedRoomApps.some((app) => app.id === id)
+    if (activeRoomAppId && hostIsGone(activeRoomAppId)) setActiveRoomAppId(null)
+    if (expandedRoomAppId && hostIsGone(expandedRoomAppId))
+      setExpandedRoomAppId(null)
+    setLaunchedRoomAppIds((previous) => {
+      const next = previous.filter((id) => !hostIsGone(id))
+      return next.length === previous.length ? previous : next
+    })
+  }, [
+    activeRoomAppId,
+    connectionStatus,
+    curatedRoomApps,
+    expandedRoomAppId,
+    roomAppsEnabled,
+  ])
+
+  useEffect(() => {
+    if (!expandedRoomAppId) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return
+      event.preventDefault()
+      setExpandedRoomAppId(null)
+    }
+    window.addEventListener("keydown", onKeyDown, true)
+    return () => window.removeEventListener("keydown", onKeyDown, true)
+  }, [expandedRoomAppId])
+
+  useEffect(() => {
+    if (expandedRoomAppId && expandedRoomAppId !== activeRoomAppId)
+      setExpandedRoomAppId(null)
+  }, [activeRoomAppId, expandedRoomAppId])
+
+  const launchRoomApp = useCallback((appId: string) => {
+    setLaunchedRoomAppIds((previous) =>
+      previous.includes(appId)
+        ? previous
+        : [...previous, appId].slice(-ROOM_APP_MAX_INSTANCES)
+    )
+  }, [])
+
+  const toggleRoomAppFullscreen = useCallback(
+    (appId: string) => {
+      if (activeRoomAppId !== appId) return
+      setExpandedRoomAppId((current) => (current === appId ? null : appId))
+    },
+    [activeRoomAppId]
+  )
+
+  const hideRoomApp = useCallback((appId: string) => {
+    setActiveRoomAppId((current) => (current === appId ? null : current))
+    setExpandedRoomAppId((current) => (current === appId ? null : current))
+  }, [])
+
+  useEffect(() => {
+    setReadyRoomAppIds((previous) => {
+      const next = previous.filter((id) => launchedRoomAppIds.includes(id))
+      return next.length === previous.length ? previous : next
+    })
+  }, [launchedRoomAppIds])
+
+  useEffect(() => {
+    if (
+      initialRoomAppLaunchAttemptedRef.current ||
+      !initialRoomAppId ||
+      !roomAppsEnabled
+    )
+      return
+    initialRoomAppLaunchAttemptedRef.current = true
+    if (!curatedRoomApps.some((app) => app.id === initialRoomAppId)) return
+    launchRoomApp(initialRoomAppId)
+    setActiveRoomAppId(initialRoomAppId)
+  }, [curatedRoomApps, initialRoomAppId, launchRoomApp, roomAppsEnabled])
+
+  const handleRoomAppReady = useCallback((appId: string) => {
+    setReadyRoomAppIds((previous) =>
+      previous.includes(appId) ? previous : [...previous, appId]
+    )
+    if (appId === "whiteboard")
+      trackAnalyticsEvent("RoomAppMounted", { app: "whiteboard" })
+  }, [])
+
+  useEffect(() => {
+    if (
+      whiteboardSharedSessionTrackedRef.current ||
+      !whiteboardResident ||
+      !whiteboardReady ||
+      humanParticipantCount < 2
+    )
+      return
+    whiteboardSharedSessionTrackedRef.current = true
+    trackAnalyticsEvent("RoomAppSharedSession", {
+      app: "whiteboard",
+      participantsBucket: participantsBucket(humanParticipantCount),
+    })
+  }, [humanParticipantCount, whiteboardReady, whiteboardResident])
+
+  const screenshareAllowed = resolvedRoomType === "screenshare"
+
+  const handleStartTask = useCallback(
+    (peerId: string, name: string) => {
+      const participant = participants.find(
+        (candidate) => candidate.peerId === peerId && candidate.kind === "agent"
+      )
+      if (!participant) return
+      setTaskAgent({ peerId, name })
+      setTaskInstruction("")
+      setTaskError("")
+    },
+    [participants]
+  )
+
+  const closeTaskComposer = useCallback(() => {
+    setTaskAgent(null)
+    setTaskInstruction("")
+    setTaskError("")
+  }, [])
+
+  const submitTask = useCallback(
+    (event: React.FormEvent<HTMLFormElement>) => {
+      event.preventDefault()
+      if (!taskAgent) return
+      const sent = sendCollabRequest(taskAgent.peerId, taskInstruction)
+      if (!sent) {
+        setTaskError("任务启动失败，请检查你的连接。")
+        return
+      }
+      pendingLocalTaskSummaries.current.push(taskInstruction.trim())
+      closeTaskComposer()
+    },
+    [closeTaskComposer, sendCollabRequest, taskAgent, taskInstruction]
+  )
+
+  const toggleAgentVoice = useCallback(
+    (participantId: string, enabled: boolean) => {
+      setAgentVoice(participantId, enabled)
+      trackAnalyticsEvent(enabled ? "AgentVoiceStarted" : "AgentVoiceStopped", {
+        roomType: resolvedRoomType,
+      })
+    },
+    [resolvedRoomType, setAgentVoice]
+  )
+  const handleStartLiveTranscript = (runtimeHostId: string) => {
+    startLiveTranscript(runtimeHostId)
+    trackAnalyticsEvent("LiveTranscriptStarted", {
+      roomType: resolvedRoomType,
+    })
+  }
+
+  const handleStopLiveTranscript = () => {
+    stopLiveTranscript()
+    trackAnalyticsEvent("LiveTranscriptStopped", {
+      roomType: resolvedRoomType,
+    })
+  }
+
+  const activeScreenShares = participants.filter(
+    (p) =>
+      p.screenShareEnabled && p.peerId !== LOCAL_PEER_ID && p.screenShareStream
+  )
+
+  const [activeSharePeerId, setActiveSharePeerId] = useState<string | null>(
+    null
+  )
+  useEffect(() => {
+    if (activeScreenShares.length === 0) {
+      setActiveSharePeerId(null)
+      return
+    }
+    if (
+      !activeSharePeerId ||
+      !activeScreenShares.find((p) => p.peerId === activeSharePeerId)
+    ) {
+      setActiveSharePeerId(activeScreenShares[0].peerId)
+    }
+  }, [activeScreenShares, activeSharePeerId])
+  const activeShare =
+    activeScreenShares.find((p) => p.peerId === activeSharePeerId) ??
+    activeScreenShares[0] ??
+    null
+
+  const showTaskLiveView = Boolean(
+    activeTaskLiveView && (!activeShare || stageView === "live-view")
+  )
+  const activeSharePeerIdForStage = activeShare?.peerId
+  useEffect(() => {
+    setStageView(activeSharePeerIdForStage ? "screen" : "live-view")
+  }, [activeSharePeerIdForStage, activeTask?.requestId])
+
+  const containerRef = useRef<HTMLDivElement>(null)
+  const isDragging = useRef(false)
+  const [splitRatio, setSplitRatio] = useState(50)
+  const [isMd, setIsMd] = useState(false)
+
+  useEffect(() => {
+    const check = () => setIsMd(window.innerWidth >= 768)
+    check()
+    window.addEventListener("resize", check)
+    return () => window.removeEventListener("resize", check)
+  }, [])
+
+  useEffect(() => {
+    // A Room App is a large visual surface like screen share, so it gets the
+    // wide Stage rather than a conversation-sized pane.
+    setSplitRatio(activeScreenShares.length > 0 || visibleRoomApp ? 75 : 50)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeScreenShares.length > 0, Boolean(visibleRoomApp)])
+
+  useEffect(() => {
+    const onMouseMove = (e: MouseEvent) => {
+      if (!isDragging.current || !containerRef.current) return
+      const rect = containerRef.current.getBoundingClientRect()
+      const ratio = ((e.clientX - rect.left) / rect.width) * 100
+      setSplitRatio(Math.max(20, Math.min(80, ratio)))
+    }
+    const onMouseUp = () => {
+      isDragging.current = false
+    }
+    window.addEventListener("mousemove", onMouseMove)
+    window.addEventListener("mouseup", onMouseUp)
+    return () => {
+      window.removeEventListener("mousemove", onMouseMove)
+      window.removeEventListener("mouseup", onMouseUp)
+    }
+  }, [])
+
+  const lastBucketRef = useRef<string>("")
+  const activatedRoomRef = useRef(false)
+  useEffect(() => {
+    const bucket = participantsBucket(participants.length)
+    if (bucket !== lastBucketRef.current) {
+      lastBucketRef.current = bucket
+      umamiEvent("RoomSize", {
+        roomHash: hashRoom(roomName),
+        bucket,
+        roomType: resolvedRoomType,
+      })
+    }
+  }, [participants.length, roomName, resolvedRoomType])
+
+  useEffect(() => {
+    if (
+      activatedRoomRef.current ||
+      connectionStatus !== "connected" ||
+      participants.length < 2
+    ) {
+      return
+    }
+
+    const timeout = window.setTimeout(() => {
+      activatedRoomRef.current = true
+      trackAnalyticsEvent("RoomActivated", {
+        roomType: resolvedRoomType,
+        participantBucket: participantsBucket(participants.length),
+        activationDelaySeconds: 30,
+      })
+    }, 30_000)
+
+    return () => window.clearTimeout(timeout)
+  }, [connectionStatus, participants.length, resolvedRoomType])
+
+  // Human + Agent collaboration analytics: derived from canonical Room state
+  // (the connected roster and persisted collaboration envelopes), never from
+  // clicks. The tracker baselines the initial post-join snapshot (Agents and
+  // collaboration lifecycle that predate this browser's observation stay
+  // silent) and keeps page-lifetime dedup sets, so state refresh, resync
+  // replay, reconnect, and re-render never re-count the same Agent or the
+  // same canonical collab requestId.
+
+  // #228: collaboration-truth analytics (AgentJoined / CollabRequested /
+  // CollabOutcome) are Room/DO-authoritative now. The browser observers
+  // were removed in the same rollout so a connected Human browser can
+  // never double count canonical transitions. Acquisition / Human intent /
+  // UI events (Pageview, invites, voice/notes/transcript controls) remain
+  // browser-side.
+
+  useEffect(() => {
+    messages.forEach((m) => {
+      if (m.type !== "action" || m.actionType !== "reaction") return
+      const ts = m.actionPayload?.ts ?? "0"
+      if (ts < joinedAtTs.current) return
+      const msgId = `${m.peerId}-${m.actionPayload?.emoji}-${ts}`
+      if (processedReactionIds.current.has(msgId)) return
+      processedReactionIds.current.add(msgId)
+      spawnReaction(m.actionPayload?.emoji ?? "👍")
+    })
+  }, [messages, spawnReaction])
+
+  const hasSentTextRef = useRef(false)
+  const wrappedSendText = useCallback(
+    (text: string, targets: string[] = [], taskRequestId?: string) => {
+      if (!hasSentTextRef.current) {
+        hasSentTextRef.current = true
+        umamiEvent("ChatActivity", {
+          type: "text",
+          roomHash: hashRoom(roomName),
+        })
+      }
+      sendTextMessage(text, targets, taskRequestId)
+    },
+    [roomName, sendTextMessage]
+  )
+
+  // #363 review (point 1): the composer awaits this promise only until the
+  // submission is ready to be released — the local DataChannel transfer has
+  // genuinely begun and, when a bounded Agent-readable copy applies, that
+  // bounded copy has been published. The full 20 MB transfer is never awaited;
+  // the existing ephemeral "Sending…" timeline bubble keeps tracking it
+  // exactly as before. A failed applicable copy rejects this promise so the
+  // composer keeps a truthful draft instead of releasing the text.
+  const wrappedSendFile = useCallback(
+    async (file: File): Promise<void> => {
+      const id = `${Date.now()}-${file.name}`
+      if (file.size > MAX_FILE_SIZE) throw new Error("文件超过 20 MB 大小限制")
+      umamiEvent("ChatActivity", {
+        type: file.type.startsWith("image/") ? "image" : "file",
+        roomHash: hashRoom(roomName),
+      })
+      let markReady: (() => void) | undefined
+      let markFailed: ((error: unknown) => void) | undefined
+      const readiness = new Promise<void>((resolve, reject) => {
+        markReady = resolve
+        markFailed = reject
+      })
+      // The composer owns the pre-Send draft; this derived promise is not
+      // always awaited by its caller, so keep the rejection handled.
+      void readiness.catch(() => undefined)
+      setPendingFiles((prev) => [
+        ...prev,
+        { id, fileName: file.name, isImage: file.type.startsWith("image/") },
+      ])
+      void sendFileMessage(file, {
+        onReadiness: (error) => {
+          if (error === undefined) markReady?.()
+          else markFailed?.(error)
+        },
+      })
+        .then(() => {
+          setPendingFiles((prev) => prev.filter((f) => f.id !== id))
+        })
+        .catch((error) => {
+          markFailed?.(error)
+          setPendingFiles((prev) =>
+            prev.map((f) =>
+              f.id === id ? { ...f, error: true, errorMessage: "发送失败" } : f
+            )
+          )
+          setTimeout(
+            () => setPendingFiles((prev) => prev.filter((f) => f.id !== id)),
+            3000
+          )
+        })
+      return readiness
+    },
+    [roomName, sendFileMessage]
+  )
+
+  // #363 A2: a Human attachment inside the ACTIVE Task rides the existing
+  // bounded, task-correlated Room attachment API — never the 20 MB Room
+  // DataChannel transfer — and never falls back to Room scope. The composer
+  // owns the wake intent: an attachment-only submission wakes the Task Agent,
+  // an attachment + text submission keeps the attachment as Task context so
+  // the following text is the single addressed wake boundary.
+  const activeTaskRequestId = activeTask?.requestId
+  const wrappedSendTaskFile = useCallback(
+    async (
+      file: File,
+      taskRequestId: string,
+      wakeAgent: boolean
+    ): Promise<void> => {
+      if (!activeTaskRequestId || activeTaskRequestId !== taskRequestId)
+        throw new Error("该任务已不再有效")
+      await sendTaskAttachment(file, taskRequestId, wakeAgent)
+    },
+    [activeTaskRequestId, sendTaskAttachment]
+  )
+
+  const selfScreenShareRef = useRef(false)
+  const [screenShareWarning, setScreenShareWarning] = useState("")
+  const wrappedToggleScreenShare = useCallback(() => {
+    const isCurrentlySharing = participants.find(
+      (p) => p.peerId === LOCAL_PEER_ID
+    )?.screenShareEnabled
+    if (!isCurrentlySharing) {
+      const sharingCount = participants.filter(
+        (p) => p.screenShareEnabled
+      ).length
+      if (sharingCount >= 3) {
+        setScreenShareWarning("最多同时只能共享 3 个屏幕。")
+        setTimeout(() => setScreenShareWarning(""), 3000)
+        return
+      }
+    }
+    selfScreenShareRef.current = !isCurrentlySharing
+    umamiEvent("ScreenShare", {
+      action: isCurrentlySharing ? "stop" : "start",
+      roomHash: hashRoom(roomName),
+    })
+    toggleScreenShare()
+  }, [participants, roomName, toggleScreenShare])
+
+  const handleCollabRespond = useCallback(
+    (requestId: string, decision: "accepted" | "declined") => {
+      sendCollabResponse(requestId, decision)
+    },
+    [sendCollabResponse]
+  )
+  const handleReadArtifact = useCallback(
+    (attachmentId: string) => readRoomAttachment(attachmentId),
+    [readRoomAttachment]
+  )
+  const handleCollabResult = useCallback(
+    (requestId: string, status: "completed" | "failed", summary: string) => {
+      sendCollabResult(requestId, status, summary)
+    },
+    [sendCollabResult]
+  )
+  const handlePermissionResponse = useCallback(
+    (requestId: string, selectedOptionId: string) => {
+      sendPermissionResponse(requestId, selectedOptionId)
+    },
+    [sendPermissionResponse]
+  )
+
+  const copyInviteLink = async (appId?: string): Promise<boolean> => {
+    if (typeof window === "undefined") return false
+    const productionAppId =
+      appId === undefined ? null : resolveProductionRoomAppId(appId)
+    if (appId !== undefined && !productionAppId) return false
+    const url = buildRoomInviteUrl({
+      origin: window.location.origin,
+      roomName,
+      roomType: resolvedRoomType,
+      appId: productionAppId,
+    })
+    try {
+      await navigator.clipboard.writeText(url)
+    } catch {
+      return false
+    }
+    trackAnalyticsEvent("InviteLinkCopied", {
+      surface: productionAppId ? "room_app" : "room",
+      roomType: resolvedRoomType,
+      ...(productionAppId ? { app: productionAppId } : {}),
+    })
+    return true
+  }
+
+  const copyRoomLink = async () => {
+    if (!(await copyInviteLink())) return
+    setRoomLinkCopied(true)
+    setTimeout(() => setRoomLinkCopied(false), 2000)
+  }
+
+  const handleConnectRuntime = () => {
+    setRuntimeConnectError("")
+    void connectLocalRuntime().catch((connectError) => {
+      setRuntimeConnectError(
+        connectError instanceof Error
+          ? connectError.message
+          : "无法连接本地 Runtime"
+      )
+    })
+  }
+
+  if (connectionStatus === "failed") {
+    return (
+      <main className="flex min-h-screen flex-col items-center justify-center bg-gray-950 text-white">
+        <p className="mb-2 text-xl font-semibold text-gray-200">连接已断开</p>
+        <p className="mb-6 text-sm text-gray-500">
+          {error || "多次尝试后仍无法重新连接。"}
+        </p>
+        <button
+          onClick={() => window.location.reload()}
+          className="rounded-md bg-rose-600 px-6 py-2 text-sm font-medium text-white hover:bg-rose-500 focus:outline-none focus:ring focus:ring-yellow-400"
+        >
+          刷新页面
+        </button>
+      </main>
+    )
+  }
+
+  if (
+    (connectionStatus === "verifying" ||
+      connectionStatus === "connecting" ||
+      connectionStatus === "verification_failed") &&
+    participants.length === 0
+  ) {
+    return (
+      <main className="flex min-h-screen flex-col items-center justify-center gap-4 bg-gray-950 px-4 text-center text-white">
+        {connectionStatus === "verification_failed" ? (
+          <>
+            <p className="text-lg font-semibold text-gray-200">验证失败</p>
+            <p className="max-w-sm text-sm text-gray-500">
+              {error || "无法验证你是真人用户，请重试。"}
+            </p>
+          </>
+        ) : (
+          <>
+            <div className="h-16 w-16 animate-spin rounded-full border-4 border-gray-700 border-t-green-500" />
+            <p className="text-sm text-gray-500">
+              {connectionStatus === "verifying" ? "验证中…" : "加入中…"}
+            </p>
+          </>
+        )}
+        {/* Bounded, interaction-only Turnstile mount point — stays empty
+            unless Cloudflare decides the visitor needs to interact. */}
+        <div ref={turnstileContainerRef} />
+        {connectionStatus === "verification_failed" && (
+          <button
+            type="button"
+            onClick={retryVerification}
+            className="rounded-md bg-rose-600 px-6 py-2 text-sm font-medium text-white hover:bg-rose-500 focus:outline-none focus:ring focus:ring-yellow-400"
+          >
+            重试
+          </button>
+        )}
+      </main>
+    )
+  }
+
+  return (
+    <main
+      className="room-shell flex h-screen flex-col overflow-hidden bg-gray-900 text-white"
+      data-room-app-focus={isRoomAppFullscreen ? "true" : undefined}
+    >
+      {connectionStatus === "reconnecting" && (
+        <div
+          data-testid="room-reconnect-guard"
+          role="alert"
+          aria-live="assertive"
+          className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/60"
+        >
+          <div className="mb-4 h-10 w-10 animate-spin rounded-full border-4 border-gray-700 border-t-yellow-400" />
+          <p className="text-sm text-gray-400">重连中...</p>
+        </div>
+      )}
+
+      <header
+        className={`room-header ${
+          isRoomAppFullscreen
+            ? "hidden"
+            : "flex flex-none flex-col gap-2 border-b border-gray-800 px-4 py-3 lg:flex-row lg:items-center"
+        }`}
+        hidden={isRoomAppFullscreen}
+        aria-hidden={isRoomAppFullscreen}
+        inert={isRoomAppFullscreen}
+      >
+        <div
+          data-testid="room-header-identity"
+          className="flex min-w-0 items-center gap-2"
+        >
+          <h1 className="min-w-0 flex-1 truncate text-lg font-medium lg:flex-none">
+            #{roomName}
+          </h1>
+          <button
+            type="button"
+            onClick={() => {
+              leaveRoom()
+              router.push("/")
+            }}
+            className="room-header-leave shrink-0 rounded-md border border-gray-700 bg-gray-800 px-3 py-1 text-xs text-gray-300 hover:bg-gray-700 lg:hidden"
+          >
+            离开
+          </button>
+        </div>
+        <div
+          data-testid="room-header-features"
+          className="flex flex-none flex-col gap-2 lg:ml-auto lg:flex-row lg:items-center lg:gap-2"
+        >
+          <div className="room-header-toolbar grid grid-cols-3 gap-2 lg:flex lg:items-center">
+            <button
+              type="button"
+              onClick={copyRoomLink}
+              className="flex min-w-0 items-center justify-center gap-1 rounded-md border border-gray-700 bg-gray-800 px-2 py-1 text-xs text-gray-300 hover:bg-gray-700"
+              title="复制房间链接"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                className="h-3.5 w-3.5 shrink-0"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                strokeWidth="2"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"
+                />
+              </svg>
+              <span className="truncate">
+                {roomLinkCopied ? "已复制！" : "复制链接"}
+              </span>
+            </button>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              leaveRoom()
+              router.push("/")
+            }}
+            className="room-header-leave hidden shrink-0 rounded-md border border-gray-700 bg-gray-800 px-3 py-1 text-xs text-gray-300 hover:bg-gray-700 lg:inline-flex"
+          >
+            离开
+          </button>
+        </div>
+      </header>
+
+      {error !== "" && (
+        <div
+          className={`${
+            isRoomAppFullscreen
+              ? "hidden"
+              : "flex flex-none items-center gap-4 bg-gray-900 px-4 py-2 text-white"
+          }`}
+          hidden={isRoomAppFullscreen}
+          role="alert"
+          aria-hidden={isRoomAppFullscreen}
+          inert={isRoomAppFullscreen}
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            className="h-5 w-5 text-amber-500"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            strokeWidth="2"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
+            />
+          </svg>
+          <strong className="text-sm font-normal"> {error} </strong>
+        </div>
+      )}
+      <div
+        className={isRoomAppFullscreen ? "hidden" : undefined}
+        hidden={isRoomAppFullscreen}
+        aria-hidden={isRoomAppFullscreen}
+        inert={isRoomAppFullscreen}
+      ></div>
+      {screenShareWarning !== "" && (
+        <div
+          className={`mx-4 mt-1 flex-none items-center gap-4 rounded border border-amber-700/50 bg-amber-900/40 px-4 py-2 text-amber-200 ${
+            isRoomAppFullscreen ? "hidden" : "flex"
+          }`}
+          hidden={isRoomAppFullscreen}
+          role="alert"
+          aria-hidden={isRoomAppFullscreen}
+          inert={isRoomAppFullscreen}
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            className="h-5 w-5 shrink-0 text-amber-400"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            strokeWidth="2"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
+            />
+          </svg>
+          <span className="text-sm">{screenShareWarning}</span>
+        </div>
+      )}
+
+      <div
+        ref={containerRef}
+        className="room-content flex flex-1 flex-col overflow-hidden md:flex-row"
+      >
+        <div
+          data-testid="room-stage"
+          className="room-panel room-participants-panel flex flex-1 flex-col overflow-hidden border-b border-gray-800 md:flex-none md:border-b-0 md:border-r"
+          style={isMd ? { width: `${splitRatio}%` } : undefined}
+        >
+          {/* #111: Agent workspace snapshots — observation only, available in
+              every room type; Human screen share is untouched below. */}
+          <div
+            className={isRoomAppFullscreen ? "hidden" : undefined}
+            hidden={isRoomAppFullscreen}
+            aria-hidden={isRoomAppFullscreen}
+            inert={isRoomAppFullscreen}
+          ></div>
+          <div className="relative flex flex-1 flex-col overflow-hidden">
+            {/* The Stage entry: curated Room Apps plus the existing Screen /
+                Live View preference. Stage selection is independent from the
+                conversation scope selected in the right pane, and each Stage
+                choice appears on its own availability — a Room App is a third
+                Stage surface, so Screen no longer requires a Live View (and
+                the reverse) to be offered. */}
+            {(roomApps.length > 0 ||
+              activeScreenShares.length > 0 ||
+              Boolean(activeTaskLiveView)) && (
+              <div
+                role="tablist"
+                aria-label="Stage"
+                data-testid="stage-switcher"
+                className={`scrollbar-thin z-10 flex-none gap-1 overflow-x-auto border-b border-gray-800 bg-gray-950/80 p-2 ${
+                  isRoomAppFullscreen ? "hidden" : "flex"
+                }`}
+                hidden={isRoomAppFullscreen}
+                aria-hidden={isRoomAppFullscreen}
+                inert={isRoomAppFullscreen}
+              >
+                {roomApps.map((app) => {
+                  const selected = activeRoomAppId === app.id
+                  return (
+                    <button
+                      key={app.id}
+                      type="button"
+                      aria-pressed={selected}
+                      data-testid={`stage-app-${app.id}`}
+                      onClick={() => {
+                        if (selected) {
+                          // Hide, do not destroy: the resident host keeps its
+                          // iframe, MessagePort and App-local state.
+                          setExpandedRoomAppId(null)
+                          setActiveRoomAppId(null)
+                          return
+                        }
+                        setExpandedRoomAppId(null)
+                        launchRoomApp(app.id)
+                        setActiveRoomAppId(app.id)
+                      }}
+                      className={`shrink-0 rounded px-2 py-1 text-xs ${
+                        selected
+                          ? "bg-blue-600 text-white"
+                          : "text-gray-400 hover:bg-gray-800 hover:text-gray-200"
+                      }`}
+                    >
+                      {app.label}
+                    </button>
+                  )
+                })}
+                {activeScreenShares.length > 0 && (
+                  <button
+                    type="button"
+                    data-testid="stage-view-screen"
+                    onClick={() => {
+                      setExpandedRoomAppId(null)
+                      setStageView("screen")
+                      setActiveRoomAppId(null)
+                    }}
+                    aria-pressed={stageView === "screen" && !visibleRoomApp}
+                    className={`shrink-0 rounded px-2 py-1 text-xs ${
+                      stageView === "screen" && !visibleRoomApp
+                        ? "bg-blue-600 text-white"
+                        : "text-gray-400 hover:bg-gray-800"
+                    }`}
+                  >
+                    屏幕
+                  </button>
+                )}
+                {activeTaskLiveView && (
+                  <button
+                    type="button"
+                    data-testid="stage-view-live-view"
+                    onClick={() => {
+                      setExpandedRoomAppId(null)
+                      setStageView("live-view")
+                      setActiveRoomAppId(null)
+                    }}
+                    aria-pressed={stageView === "live-view" && !visibleRoomApp}
+                    className={`shrink-0 rounded px-2 py-1 text-xs ${
+                      stageView === "live-view" && !visibleRoomApp
+                        ? "bg-blue-600 text-white"
+                        : "text-gray-400 hover:bg-gray-800"
+                    }`}
+                  >
+                    实时视图
+                  </button>
+                )}
+              </div>
+            )}
+            {/* Resident App hosts: every launched App stays mounted for this
+                browser Room session. Stage navigation only toggles visibility,
+                so hiding one never destroys its iframe or MessagePort. Hidden
+                slots are display:none + inert + aria-hidden, which keeps them
+                out of hit-testing, focus and the accessibility tree while they
+                keep receiving the bounded App messages. */}
+            {roomAppSelf &&
+              residentRoomApps.map((app) => {
+                const productionAppId = resolveProductionRoomAppId(app.id)
+                const isFullscreen =
+                  expandedRoomAppId === app.id && activeRoomAppId === app.id
+                const visible = visibleRoomApp?.id === app.id || isFullscreen
+                const reconnectBlocked =
+                  isFullscreen && connectionStatus === "reconnecting"
+                return (
+                  <div
+                    key={app.id}
+                    data-testid={`room-app-slot-${app.id}`}
+                    aria-hidden={!visible || reconnectBlocked}
+                    inert={!visible || reconnectBlocked}
+                    className={
+                      visible ? "flex min-h-0 flex-1 flex-col" : "hidden"
+                    }
+                  >
+                    <RoomAppHost
+                      app={app}
+                      appInstanceId={roomAppInstanceId(roomName, app.id)}
+                      self={roomAppSelf}
+                      participants={roomAppParticipants}
+                      subscribe={subscribeRoomAppMessages}
+                      send={sendRoomAppMessage}
+                      onReady={handleRoomAppReady}
+                      subscribeUnicast={subscribeRoomAppUnicast}
+                      subscribeUnicastResults={subscribeRoomAppUnicastResults}
+                      sendUnicast={sendRoomAppUnicast}
+                      isFullscreen={isFullscreen}
+                      onToggleFullscreen={() => toggleRoomAppFullscreen(app.id)}
+                      onInvite={
+                        productionAppId
+                          ? () => copyInviteLink(productionAppId)
+                          : undefined
+                      }
+                      onClose={() => hideRoomApp(app.id)}
+                      onUnavailable={hideRoomApp}
+                    />
+                  </div>
+                )
+              })}
+            {!visibleRoomApp &&
+              !isRoomAppFullscreen &&
+              (activeScreenShares.length > 0 ? (
+                <>
+                  <div
+                    className={
+                      showTaskLiveView ? "hidden" : "flex min-h-0 flex-1"
+                    }
+                  >
+                    {activeShare && (
+                      <ScreenShareViewer
+                        key={activeShare.peerId}
+                        stream={activeShare.screenShareStream!}
+                        name={activeShare.name}
+                      />
+                    )}
+                  </div>
+                  <div className="room-participant-strip scrollbar-thin flex flex-none flex-row gap-2 overflow-x-auto border-t border-gray-800 p-2">
+                    {participants.map((p) => (
+                      <div
+                        key={p.peerId}
+                        className={`flex-shrink-0 rounded-xl transition-all ${
+                          p.screenShareEnabled &&
+                          p.peerId !== LOCAL_PEER_ID &&
+                          p.peerId === activeSharePeerId
+                            ? "ring-2 ring-blue-400"
+                            : ""
+                        } ${
+                          p.screenShareEnabled && p.peerId !== LOCAL_PEER_ID
+                            ? "cursor-pointer"
+                            : ""
+                        }`}
+                        onClick={() => {
+                          if (
+                            p.screenShareEnabled &&
+                            p.peerId !== LOCAL_PEER_ID
+                          ) {
+                            setActiveSharePeerId(p.peerId)
+                          }
+                        }}
+                      >
+                        <UserCard
+                          peerId={p.peerId}
+                          name={p.name}
+                          kind={p.kind}
+                          room={p.room}
+                          muteState={p.muteState}
+                          audioStream={p.audioStream}
+                          screenShareStream={p.screenShareStream}
+                          screenShareEnabled={p.screenShareEnabled}
+                          onMuteSelf={muteSelf}
+                          onToggleScreenShare={wrappedToggleScreenShare}
+                          screenshareAllowed={screenshareAllowed}
+                          voiceAvailable={
+                            p.voiceAvailable && agentVoiceMediaAvailable
+                          }
+                          voiceEnabled={p.voiceEnabled}
+                          onToggleAgentVoice={toggleAgentVoice}
+                          onStartTask={handleStartTask}
+                          className="w-[84px]"
+                          compact
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <div
+                  data-testid="room-stage-participants"
+                  className="room-participants-grid scrollbar-thin flex h-full flex-wrap content-start items-start justify-center gap-2 overflow-y-auto p-3"
+                >
+                  {participants.map((p) => (
+                    <div
+                      key={p.peerId}
+                      className="flex flex-col items-center gap-1"
+                    >
+                      <UserCard
+                        peerId={p.peerId}
+                        name={p.name}
+                        kind={p.kind}
+                        room={p.room}
+                        muteState={p.muteState}
+                        audioStream={p.audioStream}
+                        screenShareStream={p.screenShareStream}
+                        screenShareEnabled={p.screenShareEnabled}
+                        onMuteSelf={muteSelf}
+                        onToggleScreenShare={wrappedToggleScreenShare}
+                        voiceAvailable={
+                          p.voiceAvailable && agentVoiceMediaAvailable
+                        }
+                        voiceEnabled={p.voiceEnabled}
+                        onToggleAgentVoice={toggleAgentVoice}
+                        onStartTask={handleStartTask}
+                        screenshareAllowed={screenshareAllowed}
+                        className="w-40 flex-none"
+                      />
+                    </div>
+                  ))}
+                </div>
+              ))}
+
+            {!isRoomAppFullscreen &&
+              floatingReactions.map((r) => (
+                <div
+                  key={r.id}
+                  className="pointer-events-none absolute bottom-4 animate-float-up text-2xl"
+                  style={{ left: `${r.x}%` }}
+                >
+                  {r.emoji}
+                </div>
+              ))}
+          </div>
+        </div>
+
+        <div
+          className={`w-1 cursor-col-resize bg-gray-800 transition-colors hover:bg-blue-500/50 active:bg-blue-500 ${
+            isRoomAppFullscreen ? "hidden" : "hidden md:block"
+          }`}
+          hidden={isRoomAppFullscreen}
+          aria-hidden={isRoomAppFullscreen}
+          inert={isRoomAppFullscreen}
+          onMouseDown={(e) => {
+            isDragging.current = true
+            e.preventDefault()
+          }}
+        />
+
+        <div
+          className={`room-panel room-chat-panel ${
+            isRoomAppFullscreen
+              ? "hidden"
+              : "flex flex-1 flex-col overflow-hidden"
+          }`}
+          hidden={isRoomAppFullscreen}
+          aria-hidden={isRoomAppFullscreen}
+          inert={isRoomAppFullscreen}
+        >
+          <div
+            role="tablist"
+            aria-label="房间互动"
+            data-testid="interaction-tablist"
+            className="scrollbar-thin flex flex-none gap-1 overflow-x-auto border-b border-gray-800 bg-gray-950/60 px-3 py-2"
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeInteraction === "room"}
+              data-testid="interaction-tab-room"
+              onClick={() => setActiveInteraction("room")}
+              className={`shrink-0 rounded-md px-3 py-1.5 text-xs transition ${
+                activeInteraction === "room"
+                  ? "bg-blue-600 text-white"
+                  : "text-gray-400 hover:bg-gray-800 hover:text-gray-200"
+              }`}
+            >
+              房间
+            </button>
+            {taskProjections.map((task) => (
+              <button
+                key={task.requestId}
+                type="button"
+                role="tab"
+                aria-selected={activeInteraction === task.requestId}
+                data-testid={`interaction-tab-task-${task.requestId}`}
+                onClick={() => setActiveInteraction(task.requestId)}
+                title={
+                  taskIsUnavailable(task, participants)
+                    ? `${task.title} — 不可用`
+                    : task.title
+                }
+                className={`flex max-w-52 shrink-0 items-center gap-1.5 rounded-md px-3 py-1.5 text-xs transition ${
+                  activeInteraction === task.requestId
+                    ? "bg-blue-600 text-white"
+                    : "text-gray-400 hover:bg-gray-800 hover:text-gray-200"
+                }`}
+              >
+                <span className="min-w-0 flex-1 truncate">{task.title}</span>
+                <span
+                  aria-label={`状态 ${task.status}`}
+                  className="text-[10px] opacity-70"
+                >
+                  {task.status === "Completed"
+                    ? "✓"
+                    : task.status === "Failed"
+                    ? "×"
+                    : "●"}
+                </span>
+                {taskIsUnavailable(task, participants) && (
+                  <span
+                    aria-label="任务不可用"
+                    className="text-[10px] text-amber-300"
+                  >
+                    !
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
+          <div
+            data-testid="interaction-content"
+            className="flex min-h-0 flex-1 flex-col overflow-hidden"
+          >
+            {/* The conversation pane always renders the selected Room/Task
+                conversation; an active Room App lives on the Stage instead. */}
+            <div data-testid="interaction-chat" className="min-h-0 flex-1">
+              <TextChatCard
+                key={activeInteraction}
+                room={roomName}
+                nickName={nickName}
+                messages={interactionMessages}
+                attachments={interactionAttachments}
+                participants={participants}
+                pendingFiles={activeTask ? [] : pendingFiles}
+                onSendText={wrappedSendText}
+                onSendFile={wrappedSendFile}
+                onSendTaskFile={wrappedSendTaskFile}
+                onSendAction={sendActionMessage}
+                localParticipantId={effectiveLocalParticipantId}
+                onCollabRespond={handleCollabRespond}
+                onReadArtifact={handleReadArtifact}
+                onCollabResult={handleCollabResult}
+                onPermissionRespond={handlePermissionResponse}
+                taskAvailable={!activeTaskUnavailable}
+                taskRequestId={activeTask?.requestId}
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+      {taskAgent && (
+        <div
+          className={`fixed inset-0 z-40 bg-black/60 px-4 ${
+            isRoomAppFullscreen ? "hidden" : "flex items-center justify-center"
+          }`}
+          hidden={isRoomAppFullscreen}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="start-task-title"
+          aria-hidden={isRoomAppFullscreen}
+          inert={isRoomAppFullscreen}
+        >
+          <form
+            onSubmit={submitTask}
+            className="w-full max-w-md rounded-xl border border-gray-700 bg-gray-900 p-5 shadow-2xl"
+          >
+            <div className="mb-4 flex items-start justify-between gap-4">
+              <div>
+                <h2 id="start-task-title" className="text-base font-semibold">
+                  与 {taskAgent.name} 开始任务
+                </h2>
+                <p className="mt-1 text-xs text-gray-400">
+                  给这个 Agent 安排一件要做的事。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={closeTaskComposer}
+                className="text-gray-400 hover:text-white"
+                aria-label="关闭"
+              >
+                ×
+              </button>
+            </div>
+            <label
+              htmlFor="start-task-instruction"
+              className="mb-2 block text-sm text-gray-200"
+            >
+              希望这个 Agent 做什么？
+            </label>
+            <textarea
+              id="start-task-instruction"
+              value={taskInstruction}
+              onChange={(event) => setTaskInstruction(event.target.value)}
+              maxLength={MAX_COLLAB_SUMMARY_LENGTH}
+              rows={4}
+              autoFocus
+              className="w-full resize-none rounded-lg border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+            />
+            {taskError && (
+              <p role="alert" className="mt-2 text-xs text-rose-300">
+                {taskError}
+              </p>
+            )}
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={closeTaskComposer}
+                className="rounded-md border border-gray-700 px-3 py-2 text-sm text-gray-300 hover:bg-gray-800"
+              >
+                取消
+              </button>
+              <button
+                type="submit"
+                disabled={!taskInstruction.trim()}
+                className="rounded-md bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                发送
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+    </main>
+  )
+}

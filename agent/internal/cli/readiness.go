@@ -1,0 +1,171 @@
+package cli
+
+import (
+	"encoding/json"
+	"os"
+	"sort"
+	"strings"
+
+	"github.com/i365dev/free4chat/agent/internal/daemon"
+	"github.com/i365dev/free4chat/agent/internal/doctor"
+	"github.com/i365dev/free4chat/agent/internal/speech"
+)
+
+// ReadinessReport is the Go runtime readiness projection. Media and speech
+// are reported honestly: Pion is compiled in-process (available), while
+// speech distinguishes provider configuration from a live room grant (the
+// grant is room state, never claimed locally).
+type ReadinessReport struct {
+	Runtime map[string]any            `json:"runtime"`
+	Media   map[string]any            `json:"media"`
+	Speech  map[string]map[string]any `json:"speech"`
+	Harness map[string]any            `json:"harness,omitempty"`
+	Room    map[string]any            `json:"room,omitempty"`
+}
+
+func runReadiness(args []string) error {
+	speechConfig := speech.LoadConfig(daemon.RuntimeDirectory(), os.Getenv)
+	report := ReadinessReport{
+		Runtime: map[string]any{
+			"ready":   true,
+			"runtime": "go",
+			"version": doctor.Version,
+		},
+		Media: map[string]any{
+			"engine":    "pion",
+			"supported": true,
+			"ready":     true,
+		},
+		Speech: map[string]map[string]any{
+			"stt": {
+				"provider":   "doubao",
+				"configured": speechConfig.STTEnabled,
+				"ready":      speechConfig.STTEnabled,
+			},
+			"tts": {
+				"provider":   "doubao",
+				"configured": speechConfig.TTSEnabled,
+				"ready":      speechConfig.TTSEnabled,
+			},
+		},
+	}
+
+	if agentID := option(args, "--agent"); agentID != "" {
+		for _, launcher := range doctor.Collect().Launchers {
+			if launcher.ID == agentID {
+				harnessView := map[string]any{"id": launcher.ID, "ready": launcher.Ready}
+				if launcher.Note != "" {
+					harnessView["note"] = launcher.Note
+				}
+				report.Harness = harnessView
+				break
+			}
+		}
+	}
+
+	if roomID := option(args, "--room"); roomID != "" {
+		var instances []map[string]any
+		if err := daemon.EnsureDaemonVersion(doctor.Version); err == nil {
+			report.Runtime["daemonReady"] = true
+			report.Runtime["daemonVersion"] = doctor.Version
+			if result, ipcErr := daemon.SendIPC(&daemon.IpcRequest{Op: "status"}); ipcErr == nil {
+				decoded, marshalErr := decodeAny(result)
+				if marshalErr == nil {
+					if list, ok := decoded.([]any); ok {
+						for _, item := range list {
+							if record, ok := item.(map[string]any); ok {
+								instances = append(instances, record)
+							}
+						}
+					}
+				}
+			}
+		} else {
+			// The CLI version alone is not proof that the resident process is
+			// current. Keep readiness honest when an old or unverifiable daemon
+			// is already answering on the local socket.
+			report.Runtime["ready"] = false
+			report.Runtime["daemonReady"] = false
+		}
+		report.Room = roomReadiness(roomID, instances, option(args, "--agent"))
+	}
+
+	return printJSON(report)
+}
+
+// roomReadiness projects daemon status into per-room readiness, matching the
+// Node projection shape.
+func roomReadiness(roomID string, instances []map[string]any, expectedAdapter string) map[string]any {
+	var firstCandidate map[string]any
+	actualAdapters := make(map[string]struct{})
+	for _, instance := range instances {
+		if instanceRoom, _ := instance["roomId"].(string); instanceRoom != roomID {
+			continue
+		}
+		if firstCandidate == nil {
+			firstCandidate = instance
+		}
+		actualAdapter, _ := instance["adapter"].(string)
+		if actualAdapter != "" {
+			actualAdapters[actualAdapter] = struct{}{}
+		}
+		if expectedAdapter != "" && actualAdapter != expectedAdapter {
+			continue
+		}
+		return roomJoinedView(roomID, instance, actualAdapter)
+	}
+	if firstCandidate != nil && expectedAdapter != "" {
+		view := map[string]any{
+			"joined":          false,
+			"roomId":          roomID,
+			"reason":          "harness_mismatch",
+			"expectedAdapter": expectedAdapter,
+		}
+		// Keep the single-resident diagnostic field compatible with the old
+		// projection. Multiple residents have no singular actual adapter, so
+		// report a sorted set instead of making status order observable.
+		if len(actualAdapters) == 1 {
+			for actualAdapter := range actualAdapters {
+				view["actualAdapter"] = actualAdapter
+			}
+		} else if len(actualAdapters) > 1 {
+			adapters := make([]string, 0, len(actualAdapters))
+			for actualAdapter := range actualAdapters {
+				adapters = append(adapters, actualAdapter)
+			}
+			sort.Strings(adapters)
+			view["actualAdapters"] = adapters
+		}
+		return view
+	}
+	if firstCandidate != nil {
+		actualAdapter, _ := firstCandidate["adapter"].(string)
+		return roomJoinedView(roomID, firstCandidate, actualAdapter)
+	}
+	return map[string]any{"joined": false, "roomId": roomID, "reason": "not_joined"}
+}
+
+func roomJoinedView(roomID string, instance map[string]any, actualAdapter string) map[string]any {
+	view := map[string]any{"joined": true, "roomId": roomID}
+	if actualAdapter != "" {
+		view["adapter"] = actualAdapter
+	}
+	if id, ok := instance["instanceId"].(string); ok && id != "" {
+		view["instanceId"] = id
+	}
+	if pid, ok := instance["participantId"].(string); ok && pid != "" {
+		view["participantId"] = pid
+	}
+	return view
+}
+
+// decodeAny decodes raw JSON preserving number fidelity via json.Number.
+func decodeAny(raw json.RawMessage) (any, error) {
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.UseNumber()
+	var doc any
+	if err := dec.Decode(&doc); err != nil {
+		return nil, err
+	}
+	return doc, nil
+}

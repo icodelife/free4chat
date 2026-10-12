@@ -1,0 +1,21 @@
+// @ts-ignore generated at build time
+import { default as handler } from "./.open-next/worker.js"
+
+import { handleSfuRequest } from "./src/sfu/server"
+import { handleRoomRequest, isRoomRequestPath } from "./src/room/server"
+
+export { RoomSession } from "./src/do/RoomSession"
+export { ServerRegistry } from "./src/do/ServerRegistry"
+
+export default {
+  async fetch(request, env, ctx) {
+    const pathname = new URL(request.url).pathname
+    if (pathname.startsWith("/api/sfu/")) {
+      return handleSfuRequest(request, env)
+    }
+    if (isRoomRequestPath(pathname)) {
+      return handleRoomRequest(request, env)
+    }
+    return handler.fetch(request, env, ctx)
+  },
+}

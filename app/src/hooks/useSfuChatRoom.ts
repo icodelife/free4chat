@@ -1,0 +1,4137 @@
+import { useCallback, useEffect, useRef, useState } from "react"
+
+import { LOCAL_PEER_ID } from "@common/consts"
+import {
+  mergeRoomAndEphemeralMessages,
+  reconcileCanonicalRoomMessages,
+} from "@common/messageReconciliation"
+import {
+  decodeRoomAppUnicastEnvelope,
+  decodeRoomAppUnicastResult,
+  decodeRoomAppEnvelope,
+  encodeRoomAppUnicastRequest,
+  encodeRoomAppEnvelope,
+  isRoomAppInstanceForRoom,
+  roomAppRateGuard,
+  roomAppUnicastRateGuard,
+  type RoomAppLane,
+  type RoomAppUnicastEnvelope,
+  type RoomAppUnicastResult,
+  type RoomAppTransportEnvelope,
+} from "@common/roomApp"
+import { validateRoomAttachmentRead } from "@common/roomAttachments"
+import {
+  createRuntimeProviderClaim as createRuntimeProviderCredential,
+  createRuntimeProviderSecret,
+  deriveRuntimeProviderReattachHash,
+} from "@common/runtimeProviderCredential"
+import {
+  createSfuEgressSampler,
+  SFU_EGRESS_SAMPLE_INTERVAL_MS,
+  type SfuEgressSampleReason,
+} from "@common/sfuEgress"
+import {
+  encodeTaskAttachmentWake,
+  TASK_ATTACHMENT_WAKE_HEADER,
+} from "@common/taskAttachmentWake"
+import { ActionType, Message, UserInfo } from "@common/types"
+import {
+  hashRoom,
+  participantsBucket,
+  trackAnalyticsEvent,
+} from "@common/utils"
+import { MAX_COLLAB_SUMMARY_LENGTH } from "@do/collab"
+
+import type {
+  LiveTranscriptSegment,
+  LiveTranscriptState,
+  AgentActivityProjection,
+  RoomAttachmentProjection,
+  RoomAttachmentRead,
+  RuntimeHostProjection,
+  RuntimeHostProviderPublicAssociation,
+} from "../room/types"
+import type {
+  SfuAgentVoiceState,
+  SfuMessage,
+  SfuParticipant,
+  SfuRoomState,
+  SfuSessionResponse,
+  SfuTrack,
+} from "../sfu/types"
+
+type ConnectionStatus =
+  | "verifying"
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "verification_failed"
+  | "failed"
+
+class TurnstileVerificationError extends Error {
+  constructor(message = "Verification failed") {
+    super(message)
+    this.name = "TurnstileVerificationError"
+  }
+}
+
+const MAX_FILE_SIZE = 20 * 1024 * 1024
+const FILE_CHUNK_SIZE = 32 * 1024
+const FILE_BUFFER_HIGH_WATER_MARK = 256 * 1024
+const FILE_BUFFER_LOW_WATER_MARK = 64 * 1024
+const MAX_AGENT_ATTACHMENT_BYTES = 768 * 1024
+const AGENT_IMAGE_MAX_DIMENSION = 1600
+const AGENT_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"])
+const AGENT_TEXT_TYPES = new Set([
+  "text/plain",
+  "text/markdown",
+  "text/csv",
+  "application/json",
+  "text/yaml",
+])
+const AGENT_TEXT_EXTENSIONS = new Set([
+  ".txt",
+  ".md",
+  ".csv",
+  ".json",
+  ".log",
+  ".yml",
+  ".yaml",
+])
+// Cloudflare can briefly acknowledge a newly re-published Agent audio track
+// before it has an SDP answer for an already-connected Human listener. Keep
+// recovery prompt, bounded, and specific to that publication.
+const AGENT_AUDIO_SUBSCRIPTION_RETRY_DELAYS_MS = [100, 300] as const
+const MAX_AGENT_AUDIO_SUBSCRIPTION_ATTEMPTS =
+  1 + AGENT_AUDIO_SUBSCRIPTION_RETRY_DELAYS_MS.length
+// A newly published Human screen-share track can be visible in Room state
+// before Cloudflare makes it available to tracks/new. Keep the retry bounded
+// and shared by Human audio/video subscriptions so one transient admission
+// response cannot permanently lose a remote screen share.
+const REMOTE_TRACK_SUBSCRIPTION_RETRY_DELAYS_MS = [
+  100, 300, 1000, 3000,
+] as const
+const REMOTE_TRACK_READY_TIMEOUT_MS = 5000
+const REMOTE_FILE_CHANNEL_OPEN_TIMEOUT_MS = 5000
+const ROOM_APP_CHANNEL_OPEN_TIMEOUT_MS = 5000
+const ROOM_APP_RETRY_DELAYS_MS = [100, 500, 2000] as const
+
+const runtimeReattachStorageKey = (room: string) =>
+  `free4chat:runtime-reattach:${room}`
+
+function readOrCreateRuntimeReattachSecret(room: string): {
+  secret: string
+  existed: boolean
+} {
+  if (typeof window === "undefined") return { secret: "", existed: false }
+  try {
+    const key = runtimeReattachStorageKey(room)
+    const existing = window.sessionStorage.getItem(key)
+    if (existing) return { secret: existing, existed: true }
+    const secret = createRuntimeProviderSecret()
+    window.sessionStorage.setItem(key, secret)
+    return { secret, existed: false }
+  } catch {
+    return { secret: "", existed: false }
+  }
+}
+
+function agentTextMime(file: File): string | undefined {
+  if (AGENT_TEXT_TYPES.has(file.type)) return file.type
+  const name = file.name.toLowerCase()
+  const dot = name.lastIndexOf(".")
+  const ext = dot >= 0 ? name.slice(dot) : ""
+  if (!AGENT_TEXT_EXTENSIONS.has(ext)) return undefined
+  return (
+    {
+      ".txt": "text/plain",
+      ".md": "text/markdown",
+      ".csv": "text/csv",
+      ".json": "application/json",
+      ".log": "text/plain",
+      ".yml": "text/yaml",
+      ".yaml": "text/yaml",
+    }[ext] ?? "text/plain"
+  )
+}
+
+interface IncomingFileTransfer {
+  id: string
+  name: string
+  mime: string
+  size: number
+  afterSequence?: number
+  received: number
+  chunks: ArrayBuffer[]
+}
+
+interface SfuApiResponse {
+  dataChannels?: Array<{ id?: number }>
+  errorCode?: string
+  requiresImmediateRenegotiation?: boolean
+  sessionDescription?: RTCSessionDescriptionInit
+  tracks?: Array<{
+    errorCode?: string
+    errorDescription?: string
+    mid?: string
+    trackName?: string
+  }>
+}
+
+interface AgentAudioSubscriptionRetry {
+  attempt: number
+  timeout: ReturnType<typeof setTimeout>
+  subscriberSessionId: string
+  subscriberPeerConnection: RTCPeerConnection
+}
+
+interface RemoteTrackSubscriptionRetry {
+  attempt: number
+  timeout: ReturnType<typeof setTimeout>
+  subscriberSessionId: string
+  subscriberPeerConnection: RTCPeerConnection
+}
+
+interface RemoteTrackBinding {
+  peerConnection: RTCPeerConnection
+  subscriberSessionId: string
+  mid: string
+  participantId: string
+  publisherSessionId: string
+  trackName: string
+  kind: "audio" | "video"
+  subscriptionKey: string
+  attempt: number
+  timeout: number | null
+  attached: boolean
+}
+
+interface RemoteFileChannelAttempt {
+  peerConnection: RTCPeerConnection
+  subscriberSessionId: string
+  publisherSessionId: string
+  participantKind: "human" | "agent"
+  attempt: number
+  channel: RTCDataChannel | null
+  channelId: number | null
+}
+
+interface RemoteRoomAppChannelAttempt {
+  peerConnection: RTCPeerConnection
+  subscriberSessionId: string
+  publisherSessionId: string
+  participantKind: "human" | "agent"
+  lane: RoomAppLane
+  attempt: number
+  channel: RTCDataChannel | null
+  channelId: number | null
+}
+
+export interface RoomAppTransportStats {
+  reliableMessages: number
+  realtimeMessages: number
+  bytesSent: number
+  bytesReceived: number
+  droppedMessages: number
+}
+
+function hasUsableSessionDescription(response: SfuApiResponse): boolean {
+  const description = response.sessionDescription
+  return Boolean(
+    description &&
+      typeof description.type === "string" &&
+      description.type.length > 0 &&
+      typeof description.sdp === "string" &&
+      description.sdp.length > 0
+  )
+}
+
+function addLocalMediaTrack(
+  pc: RTCPeerConnection,
+  track: MediaStreamTrack,
+  stream: MediaStream
+): RTCRtpTransceiver {
+  // A PeerConnection can already contain recvonly video transceivers created
+  // by SFU subscriptions. addTrack() is allowed to reuse one of those
+  // transceivers, which changes its direction and can make Cloudflare's next
+  // answer invalid when a second participant starts sharing. Local
+  // publications always get their own stable sendonly m-line.
+  return pc.addTransceiver(track, {
+    direction: "sendonly",
+    streams: [stream],
+  })
+}
+
+function hasRemoteTrackError(response: SfuApiResponse): boolean {
+  return Boolean(
+    response.errorCode ||
+      response.tracks?.some(
+        (track) =>
+          typeof track.errorCode === "string" && track.errorCode.length > 0
+      )
+  )
+}
+
+const TRANSIENT_REMOTE_TRACK_ADMISSION_ERRORS = new Set([
+  "empty_track_error",
+  "not_found_track_error",
+])
+
+function isTransientRemoteTrackAdmissionError(
+  response: SfuApiResponse
+): boolean {
+  const errorCodes = [
+    response.errorCode,
+    ...(response.tracks?.map((track) => track.errorCode) ?? []),
+  ]
+  return errorCodes.some(
+    (code) =>
+      typeof code === "string" &&
+      TRANSIENT_REMOTE_TRACK_ADMISSION_ERRORS.has(code)
+  )
+}
+
+function summarizeRemoteTrackResponse(response: SfuApiResponse) {
+  const tracks = Array.isArray(response.tracks) ? response.tracks : []
+  return {
+    requiresImmediateRenegotiation:
+      response.requiresImmediateRenegotiation === true,
+    hasSessionDescription: hasUsableSessionDescription(response),
+    sessionDescriptionType: response.sessionDescription?.type ?? null,
+    trackResultCount: tracks.length,
+    trackHasMid: tracks.some(
+      (track) => typeof track.mid === "string" && track.mid.length > 0
+    ),
+    topLevelErrorCode:
+      typeof response.errorCode === "string"
+        ? response.errorCode.slice(0, 64)
+        : undefined,
+    trackErrorCodes: tracks
+      .map((track) =>
+        typeof track.errorCode === "string"
+          ? track.errorCode.slice(0, 64)
+          : undefined
+      )
+      .filter((code): code is string => Boolean(code))
+      .slice(0, 4),
+  }
+}
+
+type VoiceDownstreamDiagnosticValue = string | number | boolean | string[]
+
+function voiceDownstreamDiagnostic(
+  event: string,
+  details: Record<string, VoiceDownstreamDiagnosticValue> = {}
+) {
+  // These bounded fields are intentionally emitted for production diagnosis.
+  // eslint-disable-next-line no-console
+  console.info(
+    `free4chat_voice_downstream ${JSON.stringify({ event, ...details })}`
+  )
+}
+
+function sfuClientDiagnostic(
+  event: string,
+  details: Record<string, VoiceDownstreamDiagnosticValue> = {}
+) {
+  // Keep browser diagnostics coarse and free of room, participant, session,
+  // SDP, MID, SSRC, track, file, and message identifiers.
+  // eslint-disable-next-line no-console
+  console.info(
+    `free4chat_sfu_downstream ${JSON.stringify({ event, ...details })}`
+  )
+}
+
+function diagnosticParticipantKind(
+  kind: unknown
+): "agent" | "human" | "unknown" {
+  return kind === "agent" || kind === "human" ? kind : "unknown"
+}
+
+function diagnosticTrackKind(kind: unknown): "audio" | "video" | "unknown" {
+  return kind === "audio" || kind === "video" ? kind : "unknown"
+}
+
+function diagnosticErrorType(error: unknown): string {
+  return error instanceof Error && error.name ? error.name : typeof error
+}
+
+function userFacingRoomError(error: string | undefined): string {
+  switch (error) {
+    case "runtime_provider_claim_limit":
+      return "A Runtime connection is already waiting. Try again after it finishes or expires."
+    case "runtime_provider_claim_expired":
+    case "runtime_provider_claim_not_found":
+      return "Runtime connection expired. Try again."
+    case "runtime_provider_claim_human_invalid":
+    case "runtime_provider_proof_required":
+    case "runtime_provider_handle_invalid":
+      return "Runtime connection is no longer available. Try again."
+    case "target_not_in_room":
+      return "That Agent is no longer in this Room."
+    case "target_not_agent":
+      return "Choose a connected Agent to start a task."
+    case "summary_required":
+      return "Add a short instruction for the Agent."
+    default:
+      if (error?.startsWith("runtime_"))
+        return "Runtime connection unavailable."
+      return error || "SFU room error"
+  }
+}
+
+function isAgentImage(file: File): boolean {
+  return AGENT_IMAGE_TYPES.has(file.type)
+}
+
+/** #363 A2: Task attachments reuse the existing bounded Room attachment API,
+ * whose bounded failure surface is mapped to Human-readable text. */
+function taskAttachmentErrorMessage(error: unknown): string {
+  switch (error) {
+    case "attachment_too_large":
+      return "Task attachments are limited to 768 KB"
+    case "unsupported_image_type":
+    case "unsupported_attachment_type":
+      return "Only images and text files can be attached to a task"
+    case "task_target_not_in_room":
+    case "unknown_task_request":
+      return "This task is no longer active"
+    case "task_attachment_not_participant":
+      return "This task is no longer available"
+    case "room_expired":
+      return "This Room has expired"
+    default:
+      return "Couldn't attach the file to this task"
+  }
+}
+
+/** Text-like files are uploaded for read_attachment too; the MCP layer
+ * returns them as decoded text instead of ImageContent. */
+function isAgentTextFile(file: File): boolean {
+  return (
+    file.size > 0 &&
+    file.size <= MAX_AGENT_ATTACHMENT_BYTES &&
+    agentTextMime(file) !== undefined
+  )
+}
+
+async function createAgentVisionCopy(file: File): Promise<Blob> {
+  const sourceUrl = URL.createObjectURL(file)
+  try {
+    const image = new Image()
+    image.src = sourceUrl
+    await image.decode()
+    const sourceWidth = image.naturalWidth
+    const sourceHeight = image.naturalHeight
+    if (
+      sourceWidth <= AGENT_IMAGE_MAX_DIMENSION &&
+      sourceHeight <= AGENT_IMAGE_MAX_DIMENSION &&
+      file.size <= MAX_AGENT_ATTACHMENT_BYTES
+    )
+      return file.slice(0, file.size, file.type)
+
+    let scale = Math.min(
+      1,
+      AGENT_IMAGE_MAX_DIMENSION / Math.max(sourceWidth, sourceHeight)
+    )
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const canvas = document.createElement("canvas")
+      canvas.width = Math.max(1, Math.round(sourceWidth * scale))
+      canvas.height = Math.max(1, Math.round(sourceHeight * scale))
+      const context = canvas.getContext("2d")
+      if (!context) throw new Error("Canvas is unavailable")
+      context.drawImage(image, 0, 0, canvas.width, canvas.height)
+      for (const quality of [0.82, 0.68, 0.52, 0.38]) {
+        const blob = await new Promise<Blob | null>((resolve) =>
+          canvas.toBlob(resolve, "image/jpeg", quality)
+        )
+        if (blob && blob.size <= MAX_AGENT_ATTACHMENT_BYTES) return blob
+      }
+      scale *= 0.75
+    }
+    throw new Error("Image is too large for Agent vision")
+  } finally {
+    URL.revokeObjectURL(sourceUrl)
+  }
+}
+
+/**
+ * #363 review (point 1): the composer's release edge for one Room file
+ * submission. `onReadiness` fires exactly once — after the Human DataChannel
+ * transfer has genuinely begun and, when a bounded Agent-readable copy applies
+ * to this file, after that bounded copy has been published. It receives an
+ * error instead when an applicable bounded copy could not be published, so the
+ * composer keeps its draft truthful rather than releasing text into an Agent
+ * context that is missing the attachment. The full 20 MB transfer is
+ * deliberately never awaited here.
+ */
+interface RoomFileSendHooks {
+  onReadiness?: (error?: unknown) => void
+}
+
+interface SfuSession extends SfuSessionResponse {
+  room: string
+}
+
+interface SfuServerMessage {
+  type:
+    | "state"
+    | "trackPublished"
+    | "participantUpdated"
+    | "message"
+    | "attachment"
+    | "expired"
+    | "error"
+    | "runtime-provider-claim-created"
+    | "agentActivity"
+    | "room-app-unicast"
+    | "room-app-unicast-result"
+  state?: SfuRoomState
+  attachment?: RoomAttachmentProjection
+  participant?: Partial<SfuParticipant> & {
+    track?: SfuTrack
+    sessionId?: string
+    muted?: boolean
+    fileChannelReady?: boolean
+    appDataChannelReady?: boolean
+  }
+  message?: SfuMessage
+  error?: string
+  requestId?: string
+  expiresAt?: number
+  activity?: AgentActivityProjection | null
+  agentParticipantId?: string
+  scopeId?: string
+  protocolVersion?: number
+  appInstanceId?: string
+  sourceParticipantId?: string
+  payload?: Record<string, unknown>
+  ok?: boolean
+}
+
+const roomMessageToMessage = (
+  message: SfuMessage,
+  localParticipantId?: string
+): Message => {
+  return {
+    peerId:
+      message.peerId === localParticipantId ? LOCAL_PEER_ID : message.peerId,
+    name: message.name,
+    kind: message.kind,
+    type: message.type === "action" ? "action" : "text",
+    messageId: message.id,
+    createdAt: message.createdAt,
+    sequence: message.sequence,
+    text: message.text,
+    actionType: message.actionType as ActionType | undefined,
+    actionPayload: message.actionPayload,
+    collab: message.collab,
+    permission: message.permission,
+    taskRequestId: message.taskRequestId,
+    targets: message.targets,
+  }
+}
+
+export interface UseSfuChatRoomOptions {
+  enabled?: boolean
+  /**
+   * Called only when creating a brand-new Human SFU session (never on
+   * reconnect). Must resolve with a fresh, single-use Turnstile token.
+   */
+  getTurnstileToken?: () => Promise<string>
+}
+
+export function useSfuChatRoom(
+  roomName: string,
+  nickName: string,
+  roomType: "audio" | "screenshare",
+  options: UseSfuChatRoomOptions = {}
+) {
+  const { enabled = true, getTurnstileToken } = options
+  const [participants, setParticipants] = useState<UserInfo[]>([])
+  const [messages, setMessages] = useState<Message[]>([])
+  const [attachments, setAttachments] = useState<RoomAttachmentProjection[]>([])
+  const [taskLiveViews, setTaskLiveViews] = useState<
+    SfuRoomState["taskLiveViews"]
+  >({})
+  const [error, setError] = useState("")
+  const [connectionStatus, setConnectionStatus] =
+    useState<ConnectionStatus>("verifying")
+  const [roomAppsEnabled, setRoomAppsEnabled] = useState(false)
+  const [resolvedRoomType] = useState<"audio" | "screenshare">(roomType)
+  const [liveTranscript, setLiveTranscript] = useState<LiveTranscriptState>({
+    active: false,
+  })
+  const [liveTranscriptSegments, setLiveTranscriptSegments] = useState<
+    LiveTranscriptSegment[]
+  >([])
+  const [runtimeHosts, setRuntimeHosts] = useState<
+    Record<string, RuntimeHostProjection> | undefined
+  >()
+  const [runtimeHostProviders, setRuntimeHostProviders] = useState<
+    Record<string, RuntimeHostProviderPublicAssociation> | undefined
+  >()
+  // The server's existing media-admission projection remains the final
+  // environment-level availability signal. Start false so the Room UI never
+  // offers a speculative transcript activation before authoritative state.
+  const [liveTranscriptMediaAvailable, setLiveTranscriptMediaAvailable] =
+    useState(false)
+  const [agentVoice, setAgentVoiceState] = useState<SfuAgentVoiceState>({})
+  const [agentVoiceMediaAvailable, setAgentVoiceMediaAvailable] =
+    useState(false)
+  const [agentActivities, setAgentActivities] = useState<
+    AgentActivityProjection[]
+  >([])
+  const [runtimeConnectionStatus, setRuntimeConnectionStatus] = useState<
+    "idle" | "preparing" | "copied"
+  >("idle")
+
+  const sessionRef = useRef<SfuSession | null>(null)
+  const roomStateRef = useRef<SfuRoomState | null>(null)
+  const agentActivitiesRef = useRef<AgentActivityProjection[]>([])
+  const websocketRef = useRef<WebSocket | null>(null)
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null)
+  const localAudioTrackRef = useRef<MediaStreamTrack | null>(null)
+  const localScreenTrackRef = useRef<MediaStreamTrack | null>(null)
+  const localScreenTrackNameRef = useRef("")
+  const remoteAudioStreamsRef = useRef(new Map<string, MediaStream>())
+  const remoteScreenStreamsRef = useRef(new Map<string, MediaStream>())
+  const participantMapRef = useRef(new Map<string, SfuParticipant>())
+  const subscribedTracksRef = useRef(new Set<string>())
+  // `subscribedTracksRef` is admission/in-flight state. Keep a separate set
+  // for subscriptions whose full negotiation completed, so a Room readiness
+  // reset (for example a control WebSocket reconnect) can re-assert the ACK
+  // without issuing a second tracks/new request. In-flight or failed keys
+  // never enter this set and therefore can never ACK early.
+  const readySubscribedTracksRef = useRef(new Set<string>())
+  const agentAudioSubscriptionRetriesRef = useRef(
+    new Map<string, AgentAudioSubscriptionRetry>()
+  )
+  const remoteTrackSubscriptionRetriesRef = useRef(
+    new Map<string, RemoteTrackSubscriptionRetry>()
+  )
+  const subscribeTrackRef = useRef<
+    (
+      participant: SfuParticipant,
+      track: SfuTrack,
+      attempt?: number
+    ) => Promise<void>
+  >(async () => undefined)
+  const pendingRuntimeProviderClaimsRef = useRef(
+    new Map<
+      string,
+      {
+        providerClaimSecret: string
+        resolve: (value: { providerClaimSecret: string }) => void
+        reject: (error: Error) => void
+        timeout: ReturnType<typeof setTimeout>
+      }
+    >()
+  )
+  const runtimeProviderClaimAttemptRef = useRef<{
+    room: string
+    promise: Promise<{ providerClaimSecret: string }>
+    expiresAt: number
+  } | null>(null)
+  const remoteTrackBindingsRef = useRef(new Map<string, RemoteTrackBinding>())
+  const negotiationQueueRef = useRef(Promise.resolve())
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const reconnectAttemptsRef = useRef(0)
+  const mediaReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  )
+  const mediaReconnectAttemptsRef = useRef(0)
+  const mediaReconnectPromiseRef = useRef<Promise<void> | null>(null)
+  const mediaReconnectRef = useRef<(() => Promise<void>) | null>(null)
+  const initialConnectRef = useRef<(() => Promise<void>) | null>(null)
+  const localFileChannelRef = useRef<RTCDataChannel | null>(null)
+  const remoteFileChannelsRef = useRef(new Map<string, RTCDataChannel>())
+  const remoteFileChannelAttemptsRef = useRef(
+    new Map<string, RemoteFileChannelAttempt>()
+  )
+  const remoteFileChannelAttemptCountsRef = useRef(new Map<string, number>())
+  const remoteFileChannelIdsRef = useRef(new Map<string, number>())
+  const localRoomAppChannelsRef = useRef(new Map<RoomAppLane, RTCDataChannel>())
+  const remoteRoomAppChannelsRef = useRef(new Map<string, RTCDataChannel>())
+  const remoteRoomAppChannelIdsRef = useRef(new Map<string, number>())
+  const remoteRoomAppChannelAttemptsRef = useRef(
+    new Map<string, RemoteRoomAppChannelAttempt>()
+  )
+  const remoteRoomAppChannelAttemptCountsRef = useRef(new Map<string, number>())
+  const roomAppListenersRef = useRef(
+    new Set<(message: RoomAppTransportEnvelope) => void>()
+  )
+  const roomAppUnicastListenersRef = useRef(
+    new Set<(message: RoomAppUnicastEnvelope) => void>()
+  )
+  const roomAppUnicastResultListenersRef = useRef(
+    new Set<(result: RoomAppUnicastResult) => void>()
+  )
+  const roomAppOutboundRateRef = useRef(roomAppRateGuard())
+  const roomAppInboundRateRef = useRef(roomAppRateGuard())
+  const roomAppUnicastRateRef = useRef(roomAppUnicastRateGuard())
+  const roomAppStatsRef = useRef<RoomAppTransportStats>({
+    reliableMessages: 0,
+    realtimeMessages: 0,
+    bytesSent: 0,
+    bytesReceived: 0,
+    droppedMessages: 0,
+  })
+  const roomAppsServerEnabledRef = useRef(false)
+  const roomAppsEnabledRef = useRef(false)
+  const roomAppChannelsReadyRef = useRef(false)
+  const dataChannelsRef = useRef(new Set<RTCDataChannel>())
+  const dataChannelIdsRef = useRef(new Set<number>())
+  const localFileChannelIdRef = useRef<number | null>(null)
+  const localTrackMidsRef = useRef(new Map<string, string>())
+  const incomingFilesRef = useRef(new Map<string, IncomingFileTransfer>())
+  const objectUrlsRef = useRef(new Set<string>())
+  const roomMessagesRef = useRef<Message[]>([])
+  const attachmentsRef = useRef<RoomAttachmentProjection[]>([])
+  const ephemeralMessagesRef = useRef<Message[]>([])
+  const fileSendQueueRef = useRef(Promise.resolve())
+  const dataChannelReadyRef = useRef(false)
+  const closingRef = useRef(false)
+  const sfuEgressSamplerRef = useRef<ReturnType<
+    typeof createSfuEgressSampler
+  > | null>(null)
+  const sfuEgressTimerRef = useRef<number | null>(null)
+  const sfuEgressContextRef = useRef(
+    new WeakMap<
+      object,
+      {
+        roomHash: string
+        roomType: "audio" | "screenshare"
+        participantBucket: ReturnType<typeof participantsBucket>
+      }
+    >()
+  )
+  const analyticsContextRef = useRef({ roomName, roomType: resolvedRoomType })
+  analyticsContextRef.current = { roomName, roomType: resolvedRoomType }
+  if (!sfuEgressSamplerRef.current) {
+    sfuEgressSamplerRef.current = createSfuEgressSampler((sample, source) => {
+      const sourceContext =
+        typeof source === "object" && source !== null
+          ? sfuEgressContextRef.current.get(source)
+          : undefined
+      const currentContext = analyticsContextRef.current
+      const participantCount =
+        participantMapRef.current.size || (sessionRef.current ? 1 : 0)
+      const context = sourceContext ?? {
+        roomHash: hashRoom(currentContext.roomName),
+        roomType: currentContext.roomType,
+        participantBucket: participantsBucket(participantCount),
+      }
+      trackAnalyticsEvent("SFUEgressSample", {
+        roomHash: context.roomHash,
+        roomType: context.roomType,
+        participantBucket: context.participantBucket,
+        ...sample,
+      })
+    })
+  }
+
+  const sampleSfuEgress = useCallback(
+    (
+      reason: SfuEgressSampleReason,
+      peerConnection: RTCPeerConnection | null = peerConnectionRef.current
+    ) => {
+      if (!peerConnection || typeof peerConnection.getStats !== "function")
+        return
+      const participantCount =
+        participantMapRef.current.size || (sessionRef.current ? 1 : 0)
+      sfuEgressContextRef.current.set(peerConnection, {
+        roomHash: hashRoom(analyticsContextRef.current.roomName),
+        roomType: analyticsContextRef.current.roomType,
+        participantBucket: participantsBucket(participantCount),
+      })
+      sfuEgressSamplerRef.current?.sample(
+        peerConnection,
+        () => peerConnection.getStats(),
+        reason
+      )
+    },
+    []
+  )
+
+  const rebuildParticipants = useCallback(() => {
+    const state = roomStateRef.current
+    const session = sessionRef.current
+    const localId = session?.participantId
+    const list: UserInfo[] = []
+    if (localId && session) {
+      const local = participantMapRef.current.get(localId)
+      list.push({
+        name: local?.name ?? nickName,
+        kind: local?.kind ?? "human",
+        room: roomName,
+        peerId: LOCAL_PEER_ID,
+        muteState:
+          local?.media?.muted ?? !(localAudioTrackRef.current?.enabled ?? true),
+        audioStream: localAudioTrackRef.current
+          ? new MediaStream([localAudioTrackRef.current])
+          : null,
+        screenShareEnabled: Boolean(localScreenTrackRef.current),
+        screenShareStream: localScreenTrackRef.current
+          ? new MediaStream([localScreenTrackRef.current])
+          : null,
+      })
+    }
+    for (const participant of state?.participants ?? []) {
+      if (participant.id === localId) continue
+      const hasScreenShare = (participant.media?.tracks ?? []).some(
+        (track) => track.kind === "video"
+      )
+      list.push({
+        name: participant.name,
+        kind: participant.kind,
+        room: roomName,
+        peerId: participant.id,
+        muteState: participant.media?.muted,
+        capabilities:
+          participant.kind === "agent"
+            ? participant.capabilities?.advertised
+            : undefined,
+        surface: participant.kind === "agent" ? participant.surface : undefined,
+        runtimeHostId:
+          participant.kind === "agent" ? participant.runtimeHostId : undefined,
+        voiceAvailable:
+          participant.kind === "agent" &&
+          state?.agentVoiceMediaAvailable === true &&
+          participant.runtimeHostId !== undefined &&
+          state.runtimeHosts?.[participant.runtimeHostId]?.speech.tts === true,
+        voiceEnabled:
+          participant.kind === "agent" &&
+          state?.agentVoice?.[participant.id]?.enabled === true,
+        activity:
+          participant.kind === "agent"
+            ? agentActivitiesRef.current.find(
+                (activity) =>
+                  activity.agentParticipantId === participant.id &&
+                  activity.scopeId === "room"
+              )?.state
+            : undefined,
+        audioStream: remoteAudioStreamsRef.current.get(participant.id) ?? null,
+        screenShareEnabled: hasScreenShare,
+        screenShareStream:
+          remoteScreenStreamsRef.current.get(participant.id) ?? null,
+      })
+    }
+    setParticipants(list)
+  }, [nickName, roomName])
+
+  const sendSocketMessage = useCallback((message: object): boolean => {
+    const socket = websocketRef.current
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(message))
+      return true
+    }
+    return false
+  }, [])
+
+  const isCurrentAgentAudioPublication = useCallback(
+    (participantId: string, sessionId: string, trackName: string): boolean => {
+      const participant = participantMapRef.current.get(participantId)
+      return Boolean(
+        participant?.kind === "agent" &&
+          participant.media?.sessionId === sessionId &&
+          participant.media.tracks.some(
+            (track) => track.kind === "audio" && track.trackName === trackName
+          )
+      )
+    },
+    []
+  )
+
+  const isCurrentSubscriberSession = useCallback(
+    (
+      subscriberSessionId: string,
+      subscriberPeerConnection: RTCPeerConnection
+    ): boolean =>
+      sessionRef.current?.sessionId === subscriberSessionId &&
+      peerConnectionRef.current === subscriberPeerConnection,
+    []
+  )
+
+  const removeRemoteTrackBinding = useCallback(
+    (binding: RemoteTrackBinding) => {
+      if (remoteTrackBindingsRef.current.get(binding.mid) !== binding)
+        return false
+      if (binding.timeout !== null) clearTimeout(binding.timeout)
+      remoteTrackBindingsRef.current.delete(binding.mid)
+      const hasReplacement = [...remoteTrackBindingsRef.current.values()].some(
+        (candidate) =>
+          candidate.peerConnection === binding.peerConnection &&
+          candidate.subscriptionKey === binding.subscriptionKey
+      )
+      if (!hasReplacement) {
+        subscribedTracksRef.current.delete(binding.subscriptionKey)
+        readySubscribedTracksRef.current.delete(binding.subscriptionKey)
+      }
+      return true
+    },
+    []
+  )
+
+  const clearRemoteTrackBindings = useCallback(() => {
+    for (const binding of remoteTrackBindingsRef.current.values()) {
+      if (binding.timeout !== null) clearTimeout(binding.timeout)
+      subscribedTracksRef.current.delete(binding.subscriptionKey)
+      readySubscribedTracksRef.current.delete(binding.subscriptionKey)
+    }
+    remoteTrackBindingsRef.current.clear()
+  }, [])
+
+  const clearRemoteTrackBindingsForParticipant = useCallback(
+    (participantId: string) => {
+      for (const binding of remoteTrackBindingsRef.current.values()) {
+        if (binding.participantId === participantId)
+          removeRemoteTrackBinding(binding)
+      }
+    },
+    [removeRemoteTrackBinding]
+  )
+
+  const clearRemoteTrackSubscriptionRetry = useCallback(
+    (key: string, reason?: string) => {
+      const retry = remoteTrackSubscriptionRetriesRef.current.get(key)
+      if (!retry) return
+      clearTimeout(retry.timeout)
+      remoteTrackSubscriptionRetriesRef.current.delete(key)
+      if (reason)
+        sfuClientDiagnostic("remote_track_retry_cancelled", {
+          attempt: retry.attempt,
+          reason,
+        })
+    },
+    []
+  )
+
+  const clearRemoteTrackSubscriptionRetriesForParticipant = useCallback(
+    (participantId: string, reason: string) => {
+      for (const key of remoteTrackSubscriptionRetriesRef.current.keys()) {
+        if (key.startsWith(`${participantId}:`))
+          clearRemoteTrackSubscriptionRetry(key, reason)
+      }
+    },
+    [clearRemoteTrackSubscriptionRetry]
+  )
+
+  const clearAllRemoteTrackSubscriptionRetries = useCallback(
+    (reason: string) => {
+      for (const key of remoteTrackSubscriptionRetriesRef.current.keys())
+        clearRemoteTrackSubscriptionRetry(key, reason)
+    },
+    [clearRemoteTrackSubscriptionRetry]
+  )
+
+  const resetRemoteTrackSubscription = useCallback(
+    (
+      participantId: string,
+      publisherSessionId: string,
+      trackName: string,
+      kind: "audio" | "video"
+    ) => {
+      const subscriptionKey = `${participantId}:${publisherSessionId}:${trackName}`
+      clearRemoteTrackSubscriptionRetry(subscriptionKey, "track_reset")
+      for (const binding of remoteTrackBindingsRef.current.values()) {
+        if (binding.subscriptionKey === subscriptionKey)
+          removeRemoteTrackBinding(binding)
+      }
+      subscribedTracksRef.current.delete(subscriptionKey)
+      readySubscribedTracksRef.current.delete(subscriptionKey)
+      const streams =
+        kind === "video"
+          ? remoteScreenStreamsRef.current
+          : remoteAudioStreamsRef.current
+      const stream = streams.get(participantId)
+      stream?.getTracks().forEach((track) => track.stop())
+      streams.delete(participantId)
+    },
+    [clearRemoteTrackSubscriptionRetry, removeRemoteTrackBinding]
+  )
+
+  const registerRemoteTrackBinding = useCallback(
+    (input: Omit<RemoteTrackBinding, "timeout" | "attached">) => {
+      const existing = remoteTrackBindingsRef.current.get(input.mid)
+      if (existing) removeRemoteTrackBinding(existing)
+      const binding: RemoteTrackBinding = {
+        ...input,
+        timeout: null,
+        attached: false,
+      }
+      binding.timeout = window.setTimeout(() => {
+        if (remoteTrackBindingsRef.current.get(binding.mid) !== binding) return
+        const participant = participantMapRef.current.get(binding.participantId)
+        const isCurrentSubscriber =
+          peerConnectionRef.current === binding.peerConnection &&
+          sessionRef.current?.sessionId === binding.subscriberSessionId
+        removeRemoteTrackBinding(binding)
+        sfuClientDiagnostic("remote_track_wait_timeout", {
+          participant_kind: diagnosticParticipantKind(participant?.kind),
+          track_kind: binding.kind,
+        })
+        if (
+          participant?.kind === "human" &&
+          isCurrentSubscriber &&
+          !closingRef.current
+        ) {
+          // Cloudflare already admitted this mid. Keep the dedup marker until
+          // the existing media reconnect replaces the PeerConnection/session;
+          // a Room resync on this connection must not create another mid.
+          subscribedTracksRef.current.add(binding.subscriptionKey)
+          readySubscribedTracksRef.current.delete(binding.subscriptionKey)
+          sfuClientDiagnostic("remote_track_reconnect_requested", {
+            track_kind: binding.kind,
+            reason: "wait_timeout",
+          })
+          void mediaReconnectRef.current?.()
+        }
+      }, REMOTE_TRACK_READY_TIMEOUT_MS)
+      remoteTrackBindingsRef.current.set(input.mid, binding)
+      sfuClientDiagnostic("remote_track_mid_registered", {
+        participant_kind: diagnosticParticipantKind(
+          participantMapRef.current.get(input.participantId)?.kind
+        ),
+        track_kind: input.kind,
+        attempt: input.attempt,
+      })
+      return binding
+    },
+    [removeRemoteTrackBinding]
+  )
+
+  const cleanupRemoteFileChannel = useCallback(
+    (
+      participantId: string,
+      attempt: RemoteFileChannelAttempt,
+      reason: string
+    ) => {
+      const activeAttempt =
+        remoteFileChannelAttemptsRef.current.get(participantId)
+      const readyChannel = remoteFileChannelsRef.current.get(participantId)
+      const ownsAttempt = activeAttempt === attempt
+      const ownsReadyChannel = readyChannel === attempt.channel
+      if (!ownsAttempt && !ownsReadyChannel) return false
+      if (ownsAttempt)
+        remoteFileChannelAttemptsRef.current.delete(participantId)
+      if (ownsReadyChannel) {
+        remoteFileChannelsRef.current.delete(participantId)
+        remoteFileChannelIdsRef.current.delete(participantId)
+      }
+      if (attempt.channel) {
+        dataChannelsRef.current.delete(attempt.channel)
+        attempt.channel.close()
+      }
+      if (attempt.channelId !== null)
+        dataChannelIdsRef.current.delete(attempt.channelId)
+      incomingFilesRef.current.delete(participantId)
+      sfuClientDiagnostic("remote_file_channel_retry_allowed", {
+        participant_kind: attempt.participantKind,
+        reason,
+      })
+      return true
+    },
+    []
+  )
+
+  const clearAllRemoteFileChannels = useCallback(
+    (reason: string) => {
+      const participantIds = new Set([
+        ...remoteFileChannelAttemptsRef.current.keys(),
+        ...remoteFileChannelsRef.current.keys(),
+      ])
+      for (const participantId of participantIds) {
+        const attempt =
+          remoteFileChannelAttemptsRef.current.get(participantId) ??
+          (() => {
+            const channel = remoteFileChannelsRef.current.get(participantId)
+            const channelId = remoteFileChannelIdsRef.current.get(participantId)
+            if (!channel) return null
+            return {
+              peerConnection: peerConnectionRef.current!,
+              subscriberSessionId: sessionRef.current?.sessionId ?? "",
+              publisherSessionId: "",
+              participantKind: "human" as const,
+              attempt: 0,
+              channel,
+              channelId: channelId ?? null,
+            }
+          })()
+        if (attempt) cleanupRemoteFileChannel(participantId, attempt, reason)
+      }
+    },
+    [cleanupRemoteFileChannel]
+  )
+
+  const clearAgentAudioSubscriptionRetry = useCallback(
+    (key: string, reason?: string) => {
+      const retry = agentAudioSubscriptionRetriesRef.current.get(key)
+      if (!retry) return
+      clearTimeout(retry.timeout)
+      agentAudioSubscriptionRetriesRef.current.delete(key)
+      if (reason)
+        voiceDownstreamDiagnostic("agent_audio_subscription_retry_cancelled", {
+          attempt: retry.attempt,
+          reason,
+        })
+    },
+    []
+  )
+
+  const clearAgentAudioSubscriptionRetriesForParticipant = useCallback(
+    (participantId: string, reason: string) => {
+      for (const key of agentAudioSubscriptionRetriesRef.current.keys()) {
+        if (key.startsWith(`${participantId}:`))
+          clearAgentAudioSubscriptionRetry(key, reason)
+      }
+    },
+    [clearAgentAudioSubscriptionRetry]
+  )
+
+  const clearAllAgentAudioSubscriptionRetries = useCallback(
+    (reason: string) => {
+      for (const key of agentAudioSubscriptionRetriesRef.current.keys())
+        clearAgentAudioSubscriptionRetry(key, reason)
+    },
+    [clearAgentAudioSubscriptionRetry]
+  )
+
+  const enqueueNegotiation = useCallback(
+    <T>(operation: () => Promise<T>): Promise<T> => {
+      const next = negotiationQueueRef.current.then(operation, operation)
+      negotiationQueueRef.current = next.then(
+        () => undefined,
+        () => undefined
+      )
+      return next
+    },
+    []
+  )
+
+  const apiRequest = useCallback(async (path: string, body: object) => {
+    const method =
+      path === "renegotiate" || path.endsWith("/close") ? "PUT" : "POST"
+    const response = await fetch(`/api/sfu/${path}`, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+    if (!response.ok) {
+      const data = (await response.json().catch(() => ({}))) as {
+        error?: string
+      }
+      throw new Error(data.error || `SFU request failed (${response.status})`)
+    }
+    const raw = await response.text()
+    return (raw ? JSON.parse(raw) : {}) as SfuApiResponse
+  }, [])
+
+  const closeDataChannels = useCallback(
+    async (session: SfuSession | null = sessionRef.current) => {
+      if (!session || dataChannelIdsRef.current.size === 0) {
+        remoteRoomAppChannelIdsRef.current.clear()
+        return
+      }
+      const dataChannels = [...dataChannelIdsRef.current].map((id) => ({ id }))
+      try {
+        await apiRequest("datachannels/close", {
+          room: roomName,
+          participantId: session.participantId,
+          token: session.participantToken,
+          sessionId: session.sessionId,
+          dataChannels,
+        })
+      } catch {
+        // The SFU session may already be gone during network recovery.
+      } finally {
+        dataChannelIdsRef.current.clear()
+        localFileChannelIdRef.current = null
+        remoteFileChannelIdsRef.current.clear()
+        remoteRoomAppChannelIdsRef.current.clear()
+        localRoomAppChannelsRef.current.clear()
+        roomAppChannelsReadyRef.current = false
+      }
+    },
+    [apiRequest, roomName]
+  )
+
+  const waitForDataChannelOpen = useCallback(
+    (channel: RTCDataChannel, timeoutMs = 10000): Promise<void> => {
+      if (channel.readyState === "open") return Promise.resolve()
+      return new Promise((resolve, reject) => {
+        const timeout = window.setTimeout(() => {
+          cleanup()
+          reject(new Error("SFU data channel timed out"))
+        }, timeoutMs)
+        const cleanup = () => {
+          window.clearTimeout(timeout)
+          channel.removeEventListener("open", onOpen)
+          channel.removeEventListener("close", onClose)
+          channel.removeEventListener("error", onError)
+        }
+        const onOpen = () => {
+          cleanup()
+          resolve()
+        }
+        const onClose = () => {
+          cleanup()
+          reject(new Error("SFU data channel closed"))
+        }
+        const onError = () => {
+          cleanup()
+          reject(new Error("SFU data channel failed"))
+        }
+        channel.addEventListener("open", onOpen)
+        channel.addEventListener("close", onClose)
+        channel.addEventListener("error", onError)
+      })
+    },
+    []
+  )
+
+  const waitForSendCapacity = useCallback(
+    (channel: RTCDataChannel): Promise<void> => {
+      if (channel.bufferedAmount <= FILE_BUFFER_HIGH_WATER_MARK)
+        return Promise.resolve()
+      return new Promise((resolve, reject) => {
+        const timeout = window.setTimeout(() => {
+          cleanup()
+          reject(new Error("SFU data channel backpressure timeout"))
+        }, 10000)
+        const cleanup = () => {
+          window.clearTimeout(timeout)
+          channel.removeEventListener("bufferedamountlow", onLow)
+          channel.removeEventListener("close", onClose)
+          channel.removeEventListener("error", onError)
+        }
+        const onLow = () => {
+          cleanup()
+          resolve()
+        }
+        const onClose = () => {
+          cleanup()
+          reject(new Error("SFU data channel closed"))
+        }
+        const onError = () => {
+          cleanup()
+          reject(new Error("SFU data channel failed"))
+        }
+        channel.bufferedAmountLowThreshold = FILE_BUFFER_LOW_WATER_MARK
+        channel.addEventListener("bufferedamountlow", onLow)
+        channel.addEventListener("close", onClose)
+        channel.addEventListener("error", onError)
+      })
+    },
+    []
+  )
+
+  const replaceRoomMessages = useCallback((nextMessages: Message[]) => {
+    roomMessagesRef.current = reconcileCanonicalRoomMessages(
+      roomMessagesRef.current,
+      nextMessages
+    )
+    setMessages(
+      mergeRoomAndEphemeralMessages(
+        roomMessagesRef.current,
+        ephemeralMessagesRef.current
+      )
+    )
+  }, [])
+
+  const appendRoomMessage = useCallback((message: Message) => {
+    roomMessagesRef.current = [...roomMessagesRef.current, message]
+    setMessages(
+      mergeRoomAndEphemeralMessages(
+        roomMessagesRef.current,
+        ephemeralMessagesRef.current
+      )
+    )
+  }, [])
+
+  const appendEphemeralMessage = useCallback((message: Message) => {
+    if (
+      message.messageId &&
+      ephemeralMessagesRef.current.some(
+        (existing) => existing.messageId === message.messageId
+      )
+    )
+      return
+    ephemeralMessagesRef.current = [
+      ...ephemeralMessagesRef.current,
+      { ...message, ephemeral: true },
+    ]
+    setMessages(
+      mergeRoomAndEphemeralMessages(
+        roomMessagesRef.current,
+        ephemeralMessagesRef.current
+      )
+    )
+  }, [])
+
+  const latestObservedRoomSequence = useCallback(() => {
+    const latestMessageSequence = roomMessagesRef.current.reduce(
+      (latest, message) =>
+        typeof message.sequence === "number" &&
+        Number.isSafeInteger(message.sequence) &&
+        message.sequence >= 0
+          ? Math.max(latest, message.sequence)
+          : latest,
+      0
+    )
+
+    return attachmentsRef.current.reduce(
+      (latest, attachment) =>
+        typeof attachment.sequence === "number" &&
+        Number.isSafeInteger(attachment.sequence) &&
+        attachment.sequence >= 0
+          ? Math.max(latest, attachment.sequence)
+          : latest,
+      latestMessageSequence
+    )
+  }, [])
+
+  const addReceivedFileMessage = useCallback(
+    (
+      peerId: string,
+      name: string,
+      file: Pick<
+        IncomingFileTransfer,
+        "id" | "name" | "mime" | "size" | "afterSequence"
+      >,
+      chunks: ArrayBuffer[]
+    ) => {
+      const blob = new Blob(chunks, { type: file.mime })
+      const fileLink = URL.createObjectURL(blob)
+      objectUrlsRef.current.add(fileLink)
+      appendEphemeralMessage({
+        peerId,
+        name,
+        type: file.mime.startsWith("image/") ? "image" : "file",
+        messageId: file.id,
+        afterSequence: file.afterSequence,
+        fileLink,
+        fileName: file.name,
+        fileSize: file.size,
+      })
+    },
+    [appendEphemeralMessage]
+  )
+
+  const resetRemoteParticipant = useCallback(
+    (participantId: string) => {
+      clearAgentAudioSubscriptionRetriesForParticipant(
+        participantId,
+        "participant_reset"
+      )
+      clearRemoteTrackSubscriptionRetriesForParticipant(
+        participantId,
+        "participant_reset"
+      )
+      for (const key of subscribedTracksRef.current) {
+        if (key.startsWith(`${participantId}:`))
+          subscribedTracksRef.current.delete(key)
+      }
+      for (const key of readySubscribedTracksRef.current) {
+        if (key.startsWith(`${participantId}:`))
+          readySubscribedTracksRef.current.delete(key)
+      }
+
+      clearRemoteTrackBindingsForParticipant(participantId)
+      const fileAttempt =
+        remoteFileChannelAttemptsRef.current.get(participantId) ??
+        (() => {
+          const channel = remoteFileChannelsRef.current.get(participantId)
+          const channelId = remoteFileChannelIdsRef.current.get(participantId)
+          if (!channel) return null
+          return {
+            peerConnection: peerConnectionRef.current!,
+            subscriberSessionId: sessionRef.current?.sessionId ?? "",
+            publisherSessionId: "",
+            participantKind: "human" as const,
+            attempt: 0,
+            channel,
+            channelId: channelId ?? null,
+          }
+        })()
+      if (fileAttempt)
+        cleanupRemoteFileChannel(
+          participantId,
+          fileAttempt,
+          "participant_reset"
+        )
+      remoteFileChannelAttemptCountsRef.current.delete(participantId)
+
+      remoteAudioStreamsRef.current
+        .get(participantId)
+        ?.getTracks()
+        .forEach((track) => track.stop())
+      remoteScreenStreamsRef.current
+        .get(participantId)
+        ?.getTracks()
+        .forEach((track) => track.stop())
+      remoteAudioStreamsRef.current.delete(participantId)
+      remoteScreenStreamsRef.current.delete(participantId)
+    },
+    [
+      clearAgentAudioSubscriptionRetriesForParticipant,
+      clearRemoteTrackSubscriptionRetriesForParticipant,
+      clearRemoteTrackBindingsForParticipant,
+      cleanupRemoteFileChannel,
+    ]
+  )
+
+  const handleFileChannelMessage = useCallback(
+    (channelKey: string, peerId: string, name: string, event: MessageEvent) => {
+      if (typeof event.data === "string") {
+        let message: {
+          type?: string
+          id?: string
+          name?: string
+          mime?: string
+          size?: number
+          afterSequence?: number
+        }
+        try {
+          message = JSON.parse(event.data) as typeof message
+        } catch {
+          return
+        }
+        if (
+          message.type === "file-start" &&
+          message.id &&
+          typeof message.name === "string" &&
+          typeof message.mime === "string" &&
+          typeof message.size === "number" &&
+          message.size >= 0 &&
+          message.size <= MAX_FILE_SIZE
+        ) {
+          incomingFilesRef.current.set(channelKey, {
+            id: message.id,
+            name: message.name.slice(0, 256),
+            mime: message.mime.slice(0, 128),
+            size: message.size,
+            // The sender reports the latest Room sequence it had observed at
+            // transfer start. Preserve it even when this receiver's Room
+            // socket is behind; later Room messages can still arrive and
+            // complete the causal ordering.
+            afterSequence:
+              typeof message.afterSequence === "number" &&
+              Number.isSafeInteger(message.afterSequence) &&
+              message.afterSequence >= 0
+                ? message.afterSequence
+                : undefined,
+            received: 0,
+            chunks: [],
+          })
+          return
+        }
+        if (message.type === "file-end") {
+          const transfer = incomingFilesRef.current.get(channelKey)
+          if (!transfer || transfer.id !== message.id) return
+          incomingFilesRef.current.delete(channelKey)
+          if (transfer.received !== transfer.size) return
+          addReceivedFileMessage(peerId, name, transfer, transfer.chunks)
+        }
+        return
+      }
+
+      const transfer = incomingFilesRef.current.get(channelKey)
+      if (!transfer) return
+      const consumeChunk = (chunk: ArrayBuffer) => {
+        if (transfer.received + chunk.byteLength > transfer.size) {
+          incomingFilesRef.current.delete(channelKey)
+          return
+        }
+        transfer.chunks.push(chunk)
+        transfer.received += chunk.byteLength
+      }
+      if (event.data instanceof ArrayBuffer) {
+        consumeChunk(event.data)
+      } else if (event.data instanceof Blob) {
+        void event.data.arrayBuffer().then(consumeChunk)
+      }
+    },
+    [addReceivedFileMessage]
+  )
+
+  const roomAppChannelName = useCallback(
+    (participantId: string, lane: RoomAppLane) =>
+      `room-app-${lane}-${participantId}`,
+    []
+  )
+
+  const roomAppChannelKey = useCallback(
+    (participantId: string, lane: RoomAppLane) => `${participantId}:${lane}`,
+    []
+  )
+
+  const handleRoomAppChannelMessage = useCallback(
+    (sourceParticipantId: string, lane: RoomAppLane, event: MessageEvent) => {
+      const envelope = decodeRoomAppEnvelope(event.data)
+      if (
+        !envelope ||
+        envelope.lane !== lane ||
+        !isRoomAppInstanceForRoom(roomName, envelope.appInstanceId)
+      ) {
+        roomAppStatsRef.current.droppedMessages += 1
+        return
+      }
+      const bytes = new TextEncoder().encode(
+        JSON.stringify(envelope)
+      ).byteLength
+      if (!roomAppInboundRateRef.current.allow(lane, bytes)) {
+        roomAppStatsRef.current.droppedMessages += 1
+        return
+      }
+      roomAppStatsRef.current.bytesReceived += bytes
+      if (lane === "reliable") roomAppStatsRef.current.reliableMessages += 1
+      else roomAppStatsRef.current.realtimeMessages += 1
+      const received = { ...envelope, sourceParticipantId }
+      for (const listener of roomAppListenersRef.current) listener(received)
+    },
+    [roomName]
+  )
+
+  const cleanupRemoteRoomAppChannel = useCallback(
+    (key: string, attempt: RemoteRoomAppChannelAttempt, reason: string) => {
+      const activeAttempt = remoteRoomAppChannelAttemptsRef.current.get(key)
+      const readyChannel = remoteRoomAppChannelsRef.current.get(key)
+      const ownsAttempt = activeAttempt === attempt
+      const ownsReadyChannel = readyChannel === attempt.channel
+      if (!ownsAttempt && !ownsReadyChannel) return false
+      if (ownsAttempt) remoteRoomAppChannelAttemptsRef.current.delete(key)
+      if (ownsReadyChannel) remoteRoomAppChannelsRef.current.delete(key)
+      if (attempt.channel) {
+        dataChannelsRef.current.delete(attempt.channel)
+        attempt.channel.close()
+      }
+      const channelId =
+        attempt.channelId ?? remoteRoomAppChannelIdsRef.current.get(key) ?? null
+      if (channelId !== null) dataChannelIdsRef.current.delete(channelId)
+      if (ownsReadyChannel || ownsAttempt)
+        remoteRoomAppChannelIdsRef.current.delete(key)
+      sfuClientDiagnostic("room_app_channel_cleanup", { reason })
+      return true
+    },
+    []
+  )
+
+  const clearAllRemoteRoomAppChannels = useCallback(
+    (reason: string) => {
+      const keys = new Set([
+        ...remoteRoomAppChannelAttemptsRef.current.keys(),
+        ...remoteRoomAppChannelsRef.current.keys(),
+      ])
+      for (const key of keys) {
+        const attempt =
+          remoteRoomAppChannelAttemptsRef.current.get(key) ??
+          (() => {
+            const channel = remoteRoomAppChannelsRef.current.get(key)
+            if (!channel) return null
+            const lane = key.split(":")[1] as RoomAppLane
+            return {
+              peerConnection: peerConnectionRef.current!,
+              subscriberSessionId: sessionRef.current?.sessionId ?? "",
+              publisherSessionId: "",
+              participantKind: "human" as const,
+              lane,
+              attempt: 0,
+              channel,
+              channelId: remoteRoomAppChannelIdsRef.current.get(key) ?? null,
+            }
+          })()
+        if (attempt) cleanupRemoteRoomAppChannel(key, attempt, reason)
+      }
+      remoteRoomAppChannelAttemptCountsRef.current.clear()
+    },
+    [cleanupRemoteRoomAppChannel]
+  )
+
+  const resetRemoteRoomAppParticipant = useCallback(
+    (participantId: string, reason: string) => {
+      for (const lane of ["reliable", "realtime"] as const) {
+        const key = roomAppChannelKey(participantId, lane)
+        const attempt =
+          remoteRoomAppChannelAttemptsRef.current.get(key) ??
+          (() => {
+            const channel = remoteRoomAppChannelsRef.current.get(key)
+            if (!channel) return null
+            return {
+              peerConnection: peerConnectionRef.current!,
+              subscriberSessionId: sessionRef.current?.sessionId ?? "",
+              publisherSessionId: "",
+              participantKind: "human" as const,
+              lane,
+              attempt: 0,
+              channel,
+              channelId: remoteRoomAppChannelIdsRef.current.get(key) ?? null,
+            }
+          })()
+        if (attempt) cleanupRemoteRoomAppChannel(key, attempt, reason)
+        remoteRoomAppChannelAttemptCountsRef.current.delete(key)
+      }
+    },
+    [cleanupRemoteRoomAppChannel, roomAppChannelKey]
+  )
+
+  const subscribeRoomAppChannel = useCallback(
+    async (participant: SfuParticipant, lane: RoomAppLane, attempt = 1) => {
+      const pc = peerConnectionRef.current
+      const session = sessionRef.current
+      const media = participant.media
+      const key = roomAppChannelKey(participant.id, lane)
+      if (
+        !roomAppsEnabledRef.current ||
+        !pc ||
+        !session ||
+        participant.id === session.participantId ||
+        participant.kind !== "human" ||
+        !media?.appDataChannelReady ||
+        remoteRoomAppChannelsRef.current.has(key) ||
+        remoteRoomAppChannelAttemptsRef.current.has(key) ||
+        pc.connectionState !== "connected"
+      )
+        return
+      const attemptKey =
+        (remoteRoomAppChannelAttemptCountsRef.current.get(key) ?? 0) + 1
+      remoteRoomAppChannelAttemptCountsRef.current.set(key, attemptKey)
+      const channelAttempt: RemoteRoomAppChannelAttempt = {
+        peerConnection: pc,
+        subscriberSessionId: session.sessionId,
+        publisherSessionId: media.sessionId,
+        participantKind: participant.kind,
+        lane,
+        attempt: attemptKey,
+        channel: null,
+        channelId: null,
+      }
+      remoteRoomAppChannelAttemptsRef.current.set(key, channelAttempt)
+      try {
+        const response = await apiRequest("datachannels/new", {
+          room: roomName,
+          participantId: session.participantId,
+          token: session.participantToken,
+          sessionId: session.sessionId,
+          publisherSessionId: media.sessionId,
+          dataChannels: [
+            {
+              location: "remote",
+              sessionId: media.sessionId,
+              dataChannelName: roomAppChannelName(participant.id, lane),
+              ordered: lane === "reliable",
+              ...(lane === "realtime" ? { maxRetransmits: 0 } : {}),
+              waitForAck: true,
+            },
+          ],
+        })
+        const channelId = response.dataChannels?.[0]?.id
+        if (typeof channelId !== "number")
+          throw new Error("SFU Room App data channel was not created")
+        if (
+          remoteRoomAppChannelAttemptsRef.current.get(key) !== channelAttempt ||
+          peerConnectionRef.current !== pc ||
+          sessionRef.current?.sessionId !== session.sessionId ||
+          participantMapRef.current.get(participant.id)?.media?.sessionId !==
+            media.sessionId
+        )
+          throw new Error("SFU Room App data channel became stale")
+        const channel = pc.createDataChannel(
+          `${roomAppChannelName(participant.id, lane)}-subscriber`,
+          {
+            negotiated: true,
+            id: channelId,
+            ordered: lane === "reliable",
+            ...(lane === "realtime" ? { maxRetransmits: 0 } : {}),
+          }
+        )
+        channelAttempt.channel = channel
+        channelAttempt.channelId = channelId
+        remoteRoomAppChannelIdsRef.current.set(key, channelId)
+        dataChannelsRef.current.add(channel)
+        dataChannelIdsRef.current.add(channelId)
+        channel.addEventListener("message", (event) =>
+          handleRoomAppChannelMessage(participant.id, lane, event)
+        )
+        const cleanup = () =>
+          cleanupRemoteRoomAppChannel(key, channelAttempt, "closed")
+        channel.addEventListener("close", cleanup)
+        channel.addEventListener("error", cleanup)
+        await waitForDataChannelOpen(channel, ROOM_APP_CHANNEL_OPEN_TIMEOUT_MS)
+        if (
+          remoteRoomAppChannelAttemptsRef.current.get(key) !== channelAttempt ||
+          channel.readyState !== "open"
+        )
+          throw new Error("SFU Room App data channel became stale")
+        channel.send("ack")
+        remoteRoomAppChannelAttemptsRef.current.delete(key)
+        remoteRoomAppChannelsRef.current.set(key, channel)
+      } catch {
+        cleanupRemoteRoomAppChannel(key, channelAttempt, "establishment_failed")
+        const delay = ROOM_APP_RETRY_DELAYS_MS[attempt - 1]
+        if (delay !== undefined && roomAppsEnabledRef.current) {
+          window.setTimeout(() => {
+            const current = participantMapRef.current.get(participant.id)
+            if (current)
+              void subscribeRoomAppChannel(current, lane, attempt + 1)
+          }, delay)
+        }
+      }
+    },
+    [
+      apiRequest,
+      cleanupRemoteRoomAppChannel,
+      handleRoomAppChannelMessage,
+      roomAppChannelKey,
+      roomAppChannelName,
+      roomName,
+      waitForDataChannelOpen,
+    ]
+  )
+
+  const establishDataChannelTransport = useCallback(async () => {
+    const pc = peerConnectionRef.current
+    const session = sessionRef.current
+    if (!pc || !session) throw new Error("SFU session is not ready")
+
+    const serverEvents = pc.createDataChannel("server-events")
+    dataChannelsRef.current.add(serverEvents)
+    serverEvents.addEventListener("message", () => undefined)
+    const offer = await pc.createOffer()
+    await pc.setLocalDescription(offer)
+    const response = await apiRequest("datachannels/establish", {
+      room: roomName,
+      participantId: session.participantId,
+      token: session.participantToken,
+      sessionId: session.sessionId,
+      dataChannel: {
+        location: "remote",
+        dataChannelName: "server-events",
+      },
+      sessionDescription: { type: offer.type, sdp: offer.sdp },
+    })
+    if (
+      response.requiresImmediateRenegotiation &&
+      response.sessionDescription
+    ) {
+      await pc.setRemoteDescription(response.sessionDescription)
+      const answer = await pc.createAnswer()
+      await pc.setLocalDescription(answer)
+      await apiRequest("renegotiate", {
+        room: roomName,
+        participantId: session.participantId,
+        token: session.participantToken,
+        sessionId: session.sessionId,
+        sessionDescription: { type: answer.type, sdp: answer.sdp },
+      })
+    } else if (response.sessionDescription) {
+      await pc.setRemoteDescription(response.sessionDescription)
+    }
+
+    const fileChannelName = `files-${session.participantId}`
+    const channelResponse = await apiRequest("datachannels/new", {
+      room: roomName,
+      participantId: session.participantId,
+      token: session.participantToken,
+      sessionId: session.sessionId,
+      dataChannels: [
+        {
+          location: "local",
+          dataChannelName: fileChannelName,
+          ordered: true,
+        },
+      ],
+    })
+    const channelId = channelResponse.dataChannels?.[0]?.id
+    if (typeof channelId !== "number")
+      throw new Error("SFU file data channel was not created")
+    const channel = pc.createDataChannel(fileChannelName, {
+      negotiated: true,
+      id: channelId,
+      ordered: true,
+    })
+    dataChannelsRef.current.add(channel)
+    dataChannelIdsRef.current.add(channelId)
+    channel.binaryType = "arraybuffer"
+    channel.bufferedAmountLowThreshold = FILE_BUFFER_LOW_WATER_MARK
+    localFileChannelRef.current = channel
+    localFileChannelIdRef.current = channelId
+    dataChannelReadyRef.current = true
+    if (roomAppsServerEnabledRef.current) {
+      const appChannelNames = (["reliable", "realtime"] as const).map(
+        (lane) => ({
+          lane,
+          dataChannelName: roomAppChannelName(session.participantId, lane),
+        })
+      )
+      const appChannelIds: number[] = []
+      try {
+        const appResponse = await apiRequest("datachannels/new", {
+          room: roomName,
+          participantId: session.participantId,
+          token: session.participantToken,
+          sessionId: session.sessionId,
+          dataChannels: appChannelNames.map(({ lane, dataChannelName }) => ({
+            location: "local",
+            dataChannelName,
+            ordered: lane === "reliable",
+            ...(lane === "realtime" ? { maxRetransmits: 0 } : {}),
+          })),
+        })
+        const channelIds = appResponse.dataChannels ?? []
+        appChannelIds.push(
+          ...channelIds.flatMap((entry) =>
+            typeof entry.id === "number" ? [entry.id] : []
+          )
+        )
+        if (
+          channelIds.length !== appChannelNames.length ||
+          channelIds.some((entry) => typeof entry.id !== "number")
+        )
+          throw new Error("SFU Room App data channels were not created")
+        for (const [
+          index,
+          { lane, dataChannelName },
+        ] of appChannelNames.entries()) {
+          const channelId = channelIds[index].id as number
+          const channel = pc.createDataChannel(dataChannelName, {
+            negotiated: true,
+            id: channelId,
+            ordered: lane === "reliable",
+            ...(lane === "realtime" ? { maxRetransmits: 0 } : {}),
+          })
+          dataChannelsRef.current.add(channel)
+          dataChannelIdsRef.current.add(channelId)
+          localRoomAppChannelsRef.current.set(lane, channel)
+        }
+        roomAppChannelsReadyRef.current = true
+        roomAppsEnabledRef.current = roomAppsServerEnabledRef.current
+        setRoomAppsEnabled(roomAppsEnabledRef.current)
+      } catch {
+        for (const channel of localRoomAppChannelsRef.current.values()) {
+          dataChannelsRef.current.delete(channel)
+          channel.close()
+        }
+        localRoomAppChannelsRef.current.clear()
+        for (const appChannelId of appChannelIds)
+          dataChannelIdsRef.current.delete(appChannelId)
+        roomAppChannelsReadyRef.current = false
+        roomAppsEnabledRef.current = false
+        setRoomAppsEnabled(false)
+      }
+    }
+  }, [apiRequest, roomAppChannelName, roomName])
+
+  const subscribeFileChannel = useCallback(
+    async (participant: SfuParticipant) => {
+      const pc = peerConnectionRef.current
+      const session = sessionRef.current
+      if (
+        !pc ||
+        !session ||
+        participant.id === session.participantId ||
+        !participant.media?.fileChannelReady ||
+        remoteFileChannelsRef.current.has(participant.id) ||
+        remoteFileChannelAttemptsRef.current.has(participant.id)
+      )
+        return
+      // Cloudflare's SFU requires the subscriber PeerConnection to be
+      // connected before session operations are accepted. Room state can
+      // arrive earlier, so leave this attempt unclaimed and let the
+      // connection-state resync below make the first real request.
+      if (pc.connectionState !== "connected") {
+        sfuClientDiagnostic("remote_file_channel_waiting_for_connection", {
+          participant_kind: participant.kind,
+        })
+        return
+      }
+      const media = participant.media
+      const channelKey = participant.id
+      const fileChannelName = `files-${participant.id}`
+      const attemptNumber =
+        (remoteFileChannelAttemptCountsRef.current.get(channelKey) ?? 0) + 1
+      remoteFileChannelAttemptCountsRef.current.set(channelKey, attemptNumber)
+      const attempt: RemoteFileChannelAttempt = {
+        peerConnection: pc,
+        subscriberSessionId: session.sessionId,
+        publisherSessionId: media.sessionId,
+        participantKind: participant.kind,
+        attempt: attemptNumber,
+        channel: null,
+        channelId: null,
+      }
+      remoteFileChannelAttemptsRef.current.set(channelKey, attempt)
+      sfuClientDiagnostic("remote_file_channel_connecting", {
+        participant_kind: participant.kind,
+        attempt: attemptNumber,
+      })
+      try {
+        const response = await apiRequest("datachannels/new", {
+          room: roomName,
+          participantId: session.participantId,
+          token: session.participantToken,
+          sessionId: session.sessionId,
+          publisherSessionId: media.sessionId,
+          dataChannels: [
+            {
+              location: "remote",
+              sessionId: media.sessionId,
+              dataChannelName: fileChannelName,
+              ordered: true,
+              waitForAck: true,
+            },
+          ],
+        })
+        const channelId = response.dataChannels?.[0]?.id
+        if (typeof channelId !== "number")
+          throw new Error("SFU remote file data channel was not created")
+        if (
+          remoteFileChannelAttemptsRef.current.get(channelKey) !== attempt ||
+          !isCurrentSubscriberSession(attempt.subscriberSessionId, pc) ||
+          participantMapRef.current.get(participant.id)?.media?.sessionId !==
+            media.sessionId
+        )
+          throw new Error("SFU remote file data channel became stale")
+        const channel = pc.createDataChannel(`${fileChannelName}-subscriber`, {
+          negotiated: true,
+          id: channelId,
+          ordered: true,
+        })
+        attempt.channel = channel
+        attempt.channelId = channelId
+        dataChannelsRef.current.add(channel)
+        dataChannelIdsRef.current.add(channelId)
+        channel.binaryType = "arraybuffer"
+        channel.addEventListener("message", (event) =>
+          handleFileChannelMessage(
+            channelKey,
+            participant.id,
+            participant.name,
+            event
+          )
+        )
+        const handleFailure = (reason: string) => {
+          const activeAttempt =
+            remoteFileChannelAttemptsRef.current.get(channelKey)
+          const readyChannel = remoteFileChannelsRef.current.get(channelKey)
+          if (activeAttempt !== attempt && readyChannel !== channel) return
+          sfuClientDiagnostic("remote_file_channel_closed", {
+            participant_kind: participant.kind,
+            reason,
+          })
+          cleanupRemoteFileChannel(channelKey, attempt, reason)
+        }
+        channel.addEventListener("close", () => handleFailure("closed"))
+        channel.addEventListener("error", () => handleFailure("error"))
+        await waitForDataChannelOpen(
+          channel,
+          REMOTE_FILE_CHANNEL_OPEN_TIMEOUT_MS
+        )
+        if (
+          remoteFileChannelAttemptsRef.current.get(channelKey) !== attempt ||
+          channel.readyState !== "open"
+        )
+          throw new Error("SFU remote file data channel became stale")
+        channel.send("ack")
+        if (
+          remoteFileChannelAttemptsRef.current.get(channelKey) !== attempt ||
+          channel.readyState !== "open"
+        )
+          throw new Error("SFU remote file data channel closed before ready")
+        remoteFileChannelAttemptsRef.current.delete(channelKey)
+        remoteFileChannelsRef.current.set(channelKey, channel)
+        remoteFileChannelIdsRef.current.set(channelKey, channelId)
+        sfuClientDiagnostic("remote_file_channel_ready", {
+          participant_kind: participant.kind,
+          attempt: attemptNumber,
+        })
+      } catch (error) {
+        const reason =
+          error instanceof Error &&
+          error.message === "SFU data channel timed out"
+            ? "open_timeout"
+            : "establishment_failed"
+        if (reason === "open_timeout")
+          sfuClientDiagnostic("remote_file_channel_open_timeout", {
+            participant_kind: participant.kind,
+            attempt: attemptNumber,
+          })
+        cleanupRemoteFileChannel(channelKey, attempt, reason)
+      }
+    },
+    [
+      apiRequest,
+      cleanupRemoteFileChannel,
+      handleFileChannelMessage,
+      isCurrentSubscriberSession,
+      roomName,
+      waitForDataChannelOpen,
+    ]
+  )
+
+  const publishTrack = useCallback(
+    async (
+      track: MediaStreamTrack,
+      kind: "audio" | "video",
+      trackName: string
+    ) => {
+      const pc = peerConnectionRef.current
+      const session = sessionRef.current
+      if (!pc || !session) return
+      await enqueueNegotiation(async () => {
+        const offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+        const transceiver = pc
+          .getTransceivers()
+          .find((item) => item.sender.track === track)
+        if (!transceiver?.mid) throw new Error("SFU track mid unavailable")
+        const response = await apiRequest("tracks", {
+          room: roomName,
+          participantId: session.participantId,
+          token: session.participantToken,
+          sessionId: session.sessionId,
+          tracks: [
+            { location: "local", trackName, kind, mid: transceiver.mid },
+          ],
+          sessionDescription: {
+            type: offer.type,
+            sdp: offer.sdp,
+          },
+        })
+        if (
+          !hasUsableSessionDescription(response) ||
+          !response.sessionDescription
+        )
+          throw new Error("SFU publication answer unavailable")
+        await pc.setRemoteDescription(response.sessionDescription)
+        // Cloudflare admission is not Room publication. Only advertise the
+        // local track after this PeerConnection has accepted the answer; the
+        // Worker re-checks the exact current session before committing it.
+        await apiRequest("publish-confirm", {
+          room: roomName,
+          participantId: session.participantId,
+          token: session.participantToken,
+          sessionId: session.sessionId,
+          trackName,
+          kind,
+        })
+        localTrackMidsRef.current.set(trackName, transceiver.mid)
+      })
+    },
+    [apiRequest, enqueueNegotiation, roomName]
+  )
+
+  const closePublishedTrack = useCallback(
+    async (trackName: string) => {
+      const pc = peerConnectionRef.current
+      const session = sessionRef.current
+      const mid = localTrackMidsRef.current.get(trackName)
+      if (!pc || !session || !mid) return
+      const transceiver = pc.getTransceivers().find((item) => item.mid === mid)
+      if (transceiver) pc.removeTrack(transceiver.sender)
+      try {
+        await enqueueNegotiation(async () => {
+          const offer = await pc.createOffer()
+          await pc.setLocalDescription(offer)
+          const response = await apiRequest("tracks/close", {
+            room: roomName,
+            participantId: session.participantId,
+            token: session.participantToken,
+            sessionId: session.sessionId,
+            tracks: [{ mid, trackName }],
+            sessionDescription: {
+              type: offer.type,
+              sdp: offer.sdp,
+            },
+            force: true,
+          })
+          if (response.sessionDescription)
+            await pc.setRemoteDescription(response.sessionDescription)
+        })
+      } finally {
+        localTrackMidsRef.current.delete(trackName)
+      }
+    },
+    [apiRequest, enqueueNegotiation, roomName]
+  )
+
+  const scheduleAgentAudioSubscriptionRetry = useCallback(
+    (
+      key: string,
+      participantId: string,
+      sessionId: string,
+      trackName: string,
+      attempt: number,
+      subscriberSessionId: string,
+      subscriberPeerConnection: RTCPeerConnection
+    ) => {
+      const delay = AGENT_AUDIO_SUBSCRIPTION_RETRY_DELAYS_MS[attempt - 2]
+      if (delay === undefined) return false
+      if (agentAudioSubscriptionRetriesRef.current.has(key)) return true
+      const timeout = setTimeout(() => {
+        const pending = agentAudioSubscriptionRetriesRef.current.get(key)
+        if (!pending || pending.attempt !== attempt) return
+        agentAudioSubscriptionRetriesRef.current.delete(key)
+        if (
+          !isCurrentSubscriberSession(
+            pending.subscriberSessionId,
+            pending.subscriberPeerConnection
+          )
+        ) {
+          voiceDownstreamDiagnostic(
+            "agent_audio_subscription_retry_cancelled",
+            { attempt, reason: "stale_subscriber_session" }
+          )
+          return
+        }
+        if (
+          !isCurrentAgentAudioPublication(participantId, sessionId, trackName)
+        ) {
+          subscribedTracksRef.current.delete(key)
+          readySubscribedTracksRef.current.delete(key)
+          voiceDownstreamDiagnostic(
+            "agent_audio_subscription_retry_cancelled",
+            { attempt, reason: "stale_publication" }
+          )
+          return
+        }
+        const participant = participantMapRef.current.get(participantId)
+        const track = participant?.media?.tracks.find(
+          (candidate) =>
+            candidate.kind === "audio" && candidate.trackName === trackName
+        )
+        if (!participant || !track) {
+          subscribedTracksRef.current.delete(key)
+          readySubscribedTracksRef.current.delete(key)
+          voiceDownstreamDiagnostic(
+            "agent_audio_subscription_retry_cancelled",
+            { attempt, reason: "publication_missing" }
+          )
+          return
+        }
+        // Keep the dedup set occupied until this timer is the sole logical
+        // retry chain. Clearing immediately before the synchronous retry lets
+        // that retry claim it again without a parallel Room-state attempt.
+        subscribedTracksRef.current.delete(key)
+        readySubscribedTracksRef.current.delete(key)
+        void subscribeTrackRef.current(participant, track, attempt)
+      }, delay)
+      agentAudioSubscriptionRetriesRef.current.set(key, {
+        attempt,
+        timeout,
+        subscriberSessionId,
+        subscriberPeerConnection,
+      })
+      voiceDownstreamDiagnostic("agent_audio_subscription_retry_scheduled", {
+        attempt,
+        delay_ms: delay,
+      })
+      return true
+    },
+    [isCurrentAgentAudioPublication, isCurrentSubscriberSession]
+  )
+
+  const scheduleRemoteTrackSubscriptionRetry = useCallback(
+    (
+      key: string,
+      participantId: string,
+      sessionId: string,
+      trackName: string,
+      kind: "audio" | "video",
+      attempt: number,
+      subscriberSessionId: string,
+      subscriberPeerConnection: RTCPeerConnection
+    ) => {
+      const delay = REMOTE_TRACK_SUBSCRIPTION_RETRY_DELAYS_MS[attempt - 2]
+      if (delay === undefined) return false
+      if (remoteTrackSubscriptionRetriesRef.current.has(key)) return true
+      const timeout = setTimeout(() => {
+        const pending = remoteTrackSubscriptionRetriesRef.current.get(key)
+        if (!pending || pending.attempt !== attempt) return
+        remoteTrackSubscriptionRetriesRef.current.delete(key)
+        if (
+          !isCurrentSubscriberSession(
+            pending.subscriberSessionId,
+            pending.subscriberPeerConnection
+          )
+        ) {
+          sfuClientDiagnostic("remote_track_retry_cancelled", {
+            attempt,
+            reason: "stale_subscriber_session",
+          })
+          return
+        }
+        const participant = participantMapRef.current.get(participantId)
+        const track = participant?.media?.tracks.find(
+          (candidate) =>
+            candidate.kind === kind &&
+            candidate.trackName === trackName &&
+            participant.media?.sessionId === sessionId
+        )
+        if (!participant || !track) {
+          subscribedTracksRef.current.delete(key)
+          readySubscribedTracksRef.current.delete(key)
+          sfuClientDiagnostic("remote_track_retry_cancelled", {
+            attempt,
+            reason: "publication_missing",
+          })
+          return
+        }
+        // Keep the dedup set occupied until this timer is the sole logical
+        // retry chain. Clearing immediately before the synchronous retry lets
+        // that retry claim it again without a parallel Room-state attempt.
+        subscribedTracksRef.current.delete(key)
+        readySubscribedTracksRef.current.delete(key)
+        void subscribeTrackRef.current(participant, track, attempt)
+      }, delay)
+      remoteTrackSubscriptionRetriesRef.current.set(key, {
+        attempt,
+        timeout,
+        subscriberSessionId,
+        subscriberPeerConnection,
+      })
+      sfuClientDiagnostic("remote_track_retry_scheduled", {
+        attempt,
+        delay_ms: delay,
+        track_kind: kind,
+      })
+      return true
+    },
+    [isCurrentSubscriberSession]
+  )
+
+  const subscribeTrack = useCallback(
+    async (participant: SfuParticipant, track: SfuTrack, attempt = 1) => {
+      const session = sessionRef.current
+      const pc = peerConnectionRef.current
+      const media = participant.media
+      voiceDownstreamDiagnostic("subscribe_track_entered", {
+        participant_kind: diagnosticParticipantKind(participant.kind),
+        track_kind: diagnosticTrackKind(track.kind),
+        media_present: media ? 1 : 0,
+      })
+      if (!session || !pc || !media) return
+      // A Room state update often races ICE/DTLS establishment. Do not spend
+      // the one logical subscription attempt while Cloudflare would reject
+      // the PeerConnection for not being connected yet. The connected
+      // handler replays the current participant map independently.
+      if (pc.connectionState !== "connected") {
+        sfuClientDiagnostic("remote_track_waiting_for_connection", {
+          participant_kind: participant.kind,
+          track_kind: diagnosticTrackKind(track.kind),
+        })
+        return
+      }
+      const key = `${participant.id}:${media.sessionId}:${track.trackName}`
+      const isAgentAudioSubscription =
+        participant.kind === "agent" && track.kind === "audio"
+      const subscriberSessionId = session.sessionId
+      const subscriberPeerConnection = pc
+      let binding: RemoteTrackBinding | null = null
+      const isCurrentRemoteSubscription = (): boolean =>
+        isCurrentSubscriberSession(
+          subscriberSessionId,
+          subscriberPeerConnection
+        ) &&
+        participantMapRef.current.get(participant.id)?.media?.sessionId ===
+          media.sessionId
+      const cancelStaleAgentAudioSubscription = (stage: string): boolean => {
+        if (!isAgentAudioSubscription) return false
+        const currentSubscriberSession = isCurrentSubscriberSession(
+          subscriberSessionId,
+          subscriberPeerConnection
+        )
+        const currentPublication = isCurrentAgentAudioPublication(
+          participant.id,
+          media.sessionId,
+          track.trackName
+        )
+        if (currentSubscriberSession && currentPublication) return false
+        // A new Human SFU session can reuse this remote-publication key. Do
+        // not let an old async operation clear that new session's admission.
+        if (currentSubscriberSession) {
+          subscribedTracksRef.current.delete(key)
+          readySubscribedTracksRef.current.delete(key)
+        }
+        if (binding) removeRemoteTrackBinding(binding)
+        voiceDownstreamDiagnostic("agent_audio_subscription_retry_cancelled", {
+          attempt,
+          reason: currentSubscriberSession
+            ? "stale_publication"
+            : "stale_subscriber_session",
+          stage,
+        })
+        return true
+      }
+      if (subscribedTracksRef.current.has(key)) {
+        const current = participantMapRef.current.get(participant.id)
+        if (
+          current?.media?.sessionId === media.sessionId &&
+          readySubscribedTracksRef.current.has(key) &&
+          participant.kind === "agent" &&
+          track.kind === "audio"
+        ) {
+          // The media subscription is still alive, but Room readiness may
+          // have been fail-closed by a control WebSocket close. Re-assert the
+          // ACK on resync without repeating tracks/new or renegotiation.
+          const sent = sendSocketMessage({
+            type: "agent-voice-ready",
+            agentParticipantId: participant.id,
+            sessionId: media.sessionId,
+            trackName: track.trackName,
+          })
+          voiceDownstreamDiagnostic("agent_voice_ready_reasserted", {
+            agent_voice_ready_reasserted: sent ? 1 : 0,
+          })
+        }
+        voiceDownstreamDiagnostic("subscribe_dedup_skipped", {})
+        return
+      }
+      if (cancelStaleAgentAudioSubscription("subscribe_entered")) return
+      if (!isCurrentRemoteSubscription()) return
+      subscribedTracksRef.current.add(key)
+      sfuClientDiagnostic("remote_track_subscription_requested", {
+        participant_kind: participant.kind,
+        track_kind: track.kind,
+        attempt,
+      })
+      await enqueueNegotiation(async () => {
+        if (cancelStaleAgentAudioSubscription("before_tracks_new")) return
+        if (!isCurrentRemoteSubscription()) {
+          subscribedTracksRef.current.delete(key)
+          readySubscribedTracksRef.current.delete(key)
+          return
+        }
+        let response: SfuApiResponse
+        try {
+          response = await apiRequest("tracks", {
+            room: roomName,
+            participantId: session.participantId,
+            token: session.participantToken,
+            sessionId: session.sessionId,
+            tracks: [
+              {
+                location: "remote",
+                sessionId: media.sessionId,
+                trackName: track.trackName,
+                kind: track.kind,
+              },
+            ],
+          })
+        } catch (error) {
+          if (
+            isAgentAudioSubscription &&
+            !isCurrentSubscriberSession(
+              subscriberSessionId,
+              subscriberPeerConnection
+            )
+          ) {
+            voiceDownstreamDiagnostic(
+              "agent_audio_subscription_retry_cancelled",
+              {
+                attempt,
+                reason: "stale_subscriber_session",
+                stage: "tracks-new",
+              }
+            )
+            return
+          }
+          voiceDownstreamDiagnostic("tracks_new_result", {
+            tracks_new_ok: 0,
+            stage: "tracks-new",
+            error_type: diagnosticErrorType(error),
+          })
+          voiceDownstreamDiagnostic("negotiation_failed", {
+            stage: "tracks-new",
+            error_type: diagnosticErrorType(error),
+          })
+          throw error
+        }
+        const responseSummary = summarizeRemoteTrackResponse(response)
+        voiceDownstreamDiagnostic("tracks_new_result", {
+          tracks_new_ok: 1,
+          has_session_description: responseSummary.hasSessionDescription
+            ? 1
+            : 0,
+          session_description_type:
+            responseSummary.sessionDescriptionType ?? "none",
+          track_result_count: responseSummary.trackResultCount,
+          track_has_mid: responseSummary.trackHasMid ? 1 : 0,
+          ...(responseSummary.topLevelErrorCode
+            ? { top_level_error_code: responseSummary.topLevelErrorCode }
+            : {}),
+          ...(responseSummary.trackErrorCodes.length > 0
+            ? { track_error_codes: responseSummary.trackErrorCodes }
+            : {}),
+        })
+        if (cancelStaleAgentAudioSubscription("tracks_new_response")) return
+        if (!isCurrentRemoteSubscription()) return
+        if (!hasUsableSessionDescription(response)) {
+          const scheduled = isAgentAudioSubscription
+            ? !hasRemoteTrackError(response) &&
+              attempt < MAX_AGENT_AUDIO_SUBSCRIPTION_ATTEMPTS &&
+              scheduleAgentAudioSubscriptionRetry(
+                key,
+                participant.id,
+                media.sessionId,
+                track.trackName,
+                attempt + 1,
+                subscriberSessionId,
+                subscriberPeerConnection
+              )
+            : !responseSummary.trackHasMid &&
+              isTransientRemoteTrackAdmissionError(response) &&
+              scheduleRemoteTrackSubscriptionRetry(
+                key,
+                participant.id,
+                media.sessionId,
+                track.trackName,
+                track.kind,
+                attempt + 1,
+                subscriberSessionId,
+                subscriberPeerConnection
+              )
+          if (!scheduled) {
+            if (
+              responseSummary.trackHasMid &&
+              participant.kind === "human" &&
+              !closingRef.current
+            ) {
+              // A MID means Cloudflare admitted the subscription even though
+              // it did not return an SDP offer. Keep this key occupied until
+              // the existing media reconnect replaces the PC/session; a Room
+              // resync must not create another upstream subscription here.
+              subscribedTracksRef.current.add(key)
+              readySubscribedTracksRef.current.delete(key)
+              sfuClientDiagnostic("remote_track_reconnect_requested", {
+                track_kind: track.kind,
+                reason: "mid_admitted_no_description",
+              })
+              void mediaReconnectRef.current?.()
+            } else {
+              subscribedTracksRef.current.delete(key)
+              readySubscribedTracksRef.current.delete(key)
+            }
+            if (isAgentAudioSubscription && !hasRemoteTrackError(response))
+              voiceDownstreamDiagnostic(
+                "agent_audio_subscription_retry_exhausted",
+                { attempt }
+              )
+          }
+          console.warn(
+            "sfu_remote_subscribe_missing_description",
+            summarizeRemoteTrackResponse(response)
+          )
+          return
+        }
+        const responseTrack =
+          response.tracks?.find(
+            (candidate) =>
+              candidate.trackName === track.trackName &&
+              typeof candidate.mid === "string" &&
+              candidate.mid.length > 0
+          ) ??
+          response.tracks?.find(
+            (candidate) =>
+              typeof candidate.mid === "string" && candidate.mid.length > 0
+          )
+        if (!responseTrack?.mid) {
+          subscribedTracksRef.current.delete(key)
+          readySubscribedTracksRef.current.delete(key)
+          sfuClientDiagnostic("remote_track_mid_missing", {
+            participant_kind: participant.kind,
+            track_kind: track.kind,
+            attempt,
+          })
+          return
+        }
+        binding = registerRemoteTrackBinding({
+          peerConnection: pc,
+          subscriberSessionId,
+          mid: responseTrack.mid,
+          participantId: participant.id,
+          publisherSessionId: media.sessionId,
+          trackName: track.trackName,
+          kind: track.kind,
+          subscriptionKey: key,
+          attempt,
+        })
+        try {
+          if (
+            cancelStaleAgentAudioSubscription("before_remote_description") ||
+            !isCurrentRemoteSubscription()
+          )
+            return
+          await pc.setRemoteDescription(response.sessionDescription)
+          if (
+            cancelStaleAgentAudioSubscription("remote_description_applied") ||
+            !isCurrentRemoteSubscription()
+          )
+            return
+          voiceDownstreamDiagnostic("remote_description_applied", {
+            remote_description_applied: 1,
+          })
+        } catch (error) {
+          voiceDownstreamDiagnostic("negotiation_failed", {
+            stage: "remote-description",
+            error_type: diagnosticErrorType(error),
+          })
+          throw error
+        }
+        let answer: RTCSessionDescriptionInit
+        try {
+          answer = await pc.createAnswer()
+          if (
+            cancelStaleAgentAudioSubscription("answer_created") ||
+            !isCurrentRemoteSubscription()
+          )
+            return
+          voiceDownstreamDiagnostic("answer_created", { answer_created: 1 })
+        } catch (error) {
+          voiceDownstreamDiagnostic("negotiation_failed", {
+            stage: "create-answer",
+            error_type: diagnosticErrorType(error),
+          })
+          throw error
+        }
+        try {
+          await pc.setLocalDescription(answer)
+          if (
+            cancelStaleAgentAudioSubscription("local_description_applied") ||
+            !isCurrentRemoteSubscription()
+          )
+            return
+          voiceDownstreamDiagnostic("local_description_applied", {
+            local_description_applied: 1,
+          })
+        } catch (error) {
+          voiceDownstreamDiagnostic("negotiation_failed", {
+            stage: "local-description",
+            error_type: diagnosticErrorType(error),
+          })
+          throw error
+        }
+        try {
+          if (
+            cancelStaleAgentAudioSubscription("before_renegotiate") ||
+            !isCurrentRemoteSubscription()
+          )
+            return
+          await apiRequest("renegotiate", {
+            room: roomName,
+            participantId: session.participantId,
+            token: session.participantToken,
+            sessionId: session.sessionId,
+            sessionDescription: { type: answer.type, sdp: answer.sdp },
+          })
+          if (
+            cancelStaleAgentAudioSubscription("renegotiate_complete") ||
+            !isCurrentRemoteSubscription()
+          )
+            return
+          voiceDownstreamDiagnostic("renegotiate_ok", { renegotiate_ok: 1 })
+          if (isAgentAudioSubscription) {
+            if (
+              !binding ||
+              (!binding.attached &&
+                remoteTrackBindingsRef.current.get(binding.mid) !== binding)
+            )
+              return
+            // Negotiation completion is the ACK-safe boundary. Record it
+            // even if the control WebSocket is briefly unavailable; a later
+            // resync on the new socket will re-assert the same ACK.
+            readySubscribedTracksRef.current.add(key)
+            // The Runtime must not drain a first utterance merely because
+            // Cloudflare booked its upstream publication. This ACK is sent
+            // only after the Human browser has completed the full remote
+            // tracks/new + answer + renegotiate path for that exact session
+            // and track; the Room validates it against the private current
+            // publication before making it visible to the Runtime.
+            const sent = sendSocketMessage({
+              type: "agent-voice-ready",
+              agentParticipantId: participant.id,
+              sessionId: media.sessionId,
+              trackName: track.trackName,
+            })
+            voiceDownstreamDiagnostic("agent_voice_ready_ack_sent", {
+              agent_voice_ready_ack_sent: sent ? 1 : 0,
+            })
+          }
+        } catch (error) {
+          voiceDownstreamDiagnostic("negotiation_failed", {
+            stage: "renegotiate",
+            error_type: diagnosticErrorType(error),
+          })
+          throw error
+        }
+      }).catch((error) => {
+        const hadAdmittedBinding = binding !== null
+        if (binding) removeRemoteTrackBinding(binding)
+        const currentSubscriberSession = isCurrentSubscriberSession(
+          subscriberSessionId,
+          subscriberPeerConnection
+        )
+        if (isCurrentRemoteSubscription() || currentSubscriberSession) {
+          // A Human binding means Cloudflare already admitted this mid. Keep
+          // the dedup marker so a later Room resync cannot create a duplicate
+          // upstream subscription without first replacing the PeerConnection.
+          if (hadAdmittedBinding && !isAgentAudioSubscription) {
+            subscribedTracksRef.current.add(key)
+            readySubscribedTracksRef.current.delete(key)
+          } else {
+            subscribedTracksRef.current.delete(key)
+            readySubscribedTracksRef.current.delete(key)
+          }
+        } else if (isAgentAudioSubscription) {
+          voiceDownstreamDiagnostic(
+            "agent_audio_subscription_retry_cancelled",
+            { attempt, reason: "stale_subscriber_session", stage: "failed" }
+          )
+        }
+        if (hadAdmittedBinding && participant.kind === "human")
+          sfuClientDiagnostic("remote_track_retry_blocked", {
+            track_kind: track.kind,
+            reason: "mid_admitted",
+          })
+        console.warn("sfu_remote_subscribe_failed", {
+          errorType: error instanceof Error ? error.name : typeof error,
+        })
+      })
+    },
+    [
+      apiRequest,
+      enqueueNegotiation,
+      isCurrentAgentAudioPublication,
+      isCurrentSubscriberSession,
+      registerRemoteTrackBinding,
+      removeRemoteTrackBinding,
+      roomName,
+      scheduleAgentAudioSubscriptionRetry,
+      scheduleRemoteTrackSubscriptionRetry,
+      sendSocketMessage,
+    ]
+  )
+
+  useEffect(() => {
+    subscribeTrackRef.current = subscribeTrack
+  }, [subscribeTrack])
+
+  const resubscribeRemoteMedia = useCallback(() => {
+    const pc = peerConnectionRef.current
+    const session = sessionRef.current
+    if (!pc || !session || pc.connectionState !== "connected") return
+    for (const participant of participantMapRef.current.values()) {
+      if (participant.id === session.participantId) continue
+      for (const track of participant.media?.tracks ?? [])
+        void subscribeTrack(participant, track)
+      if (participant.media?.fileChannelReady)
+        void subscribeFileChannel(participant)
+      if (participant.media?.appDataChannelReady) {
+        void subscribeRoomAppChannel(participant, "reliable")
+        void subscribeRoomAppChannel(participant, "realtime")
+      }
+    }
+  }, [subscribeFileChannel, subscribeRoomAppChannel, subscribeTrack])
+
+  const applyRoomState = useCallback(
+    (state: SfuRoomState) => {
+      roomStateRef.current = state
+      const nextAttachments = state.attachments ?? []
+      attachmentsRef.current = nextAttachments
+      setAttachments(nextAttachments)
+      setTaskLiveViews(state.taskLiveViews ?? {})
+      const agentAudioTrackCount = state.participants.reduce(
+        (count, participant) =>
+          count +
+          (participant.kind === "agent"
+            ? (participant.media?.tracks ?? []).filter(
+                (track) => track.kind === "audio"
+              ).length
+            : 0),
+        0
+      )
+      voiceDownstreamDiagnostic("room_state_observed", {
+        agent_audio_track_visible_in_state: agentAudioTrackCount > 0 ? 1 : 0,
+        agent_audio_track_count: agentAudioTrackCount,
+      })
+      setLiveTranscript(state.liveTranscript ?? { active: false })
+      setLiveTranscriptSegments(state.liveTranscriptSegments ?? [])
+      setRuntimeHosts(state.runtimeHosts)
+      setRuntimeHostProviders(state.runtimeHostProviders)
+      const localParticipantForProvider = sessionRef.current?.participantId
+      if (
+        localParticipantForProvider &&
+        Object.values(state.runtimeHostProviders ?? {}).some(
+          (association) =>
+            association.humanParticipantId === localParticipantForProvider
+        )
+      ) {
+        runtimeProviderClaimAttemptRef.current = null
+        setRuntimeConnectionStatus("idle")
+      }
+      setLiveTranscriptMediaAvailable(state.meetingNotesMediaAvailable)
+      setAgentVoiceState(state.agentVoice)
+      setAgentVoiceMediaAvailable(state.agentVoiceMediaAvailable)
+      roomAppsServerEnabledRef.current = state.roomAppsEnabled === true
+      roomAppsEnabledRef.current =
+        roomAppsServerEnabledRef.current && roomAppChannelsReadyRef.current
+      setRoomAppsEnabled(roomAppsEnabledRef.current)
+      const nextActivities = state.agentActivities ?? []
+      agentActivitiesRef.current = nextActivities
+      setAgentActivities(nextActivities)
+      const localParticipantId = sessionRef.current?.participantId
+      const currentParticipantIds = new Set(
+        state.participants.map((participant) => participant.id)
+      )
+      for (const previousParticipantId of participantMapRef.current.keys()) {
+        if (
+          previousParticipantId !== localParticipantId &&
+          !currentParticipantIds.has(previousParticipantId)
+        ) {
+          resetRemoteParticipant(previousParticipantId)
+          resetRemoteRoomAppParticipant(
+            previousParticipantId,
+            "participant_left"
+          )
+        }
+      }
+      for (const participant of state.participants) {
+        const previous = participantMapRef.current.get(participant.id)
+        const previousTracks = previous?.media?.tracks ?? []
+        const currentTracks = participant.media?.tracks ?? []
+        const agentAudioTrackRemoved =
+          participant.kind === "agent" &&
+          previousTracks.some(
+            (previousTrack) =>
+              previousTrack.kind === "audio" &&
+              !currentTracks.some(
+                (currentTrack) =>
+                  currentTrack.trackName === previousTrack.trackName &&
+                  currentTrack.kind === previousTrack.kind
+              )
+          )
+        const mediaSessionChanged = Boolean(
+          previous?.media &&
+            participant.media &&
+            previous.media.sessionId !== participant.media.sessionId
+        )
+        if (mediaSessionChanged || agentAudioTrackRemoved) {
+          resetRemoteParticipant(participant.id)
+          resetRemoteRoomAppParticipant(participant.id, "session_changed")
+        } else if (previous?.media) {
+          for (const previousTrack of previousTracks) {
+            if (
+              !currentTracks.some(
+                (currentTrack) =>
+                  currentTrack.trackName === previousTrack.trackName &&
+                  currentTrack.kind === previousTrack.kind
+              )
+            )
+              resetRemoteTrackSubscription(
+                participant.id,
+                previous.media.sessionId,
+                previousTrack.trackName,
+                previousTrack.kind
+              )
+          }
+        }
+      }
+      participantMapRef.current = new Map(
+        state.participants.map((participant) => [
+          participant.id,
+          { ...participant, token: "" } as SfuParticipant,
+        ])
+      )
+      replaceRoomMessages(
+        state.messages.map((message) =>
+          roomMessageToMessage(message, localParticipantId)
+        )
+      )
+      rebuildParticipants()
+      resubscribeRemoteMedia()
+    },
+    [
+      rebuildParticipants,
+      resetRemoteParticipant,
+      resetRemoteTrackSubscription,
+      resetRemoteRoomAppParticipant,
+      replaceRoomMessages,
+      resubscribeRemoteMedia,
+    ]
+  )
+
+  const createPeerConnection = useCallback(() => {
+    clearAllRemoteTrackSubscriptionRetries("peer_connection_replaced")
+    clearRemoteTrackBindings()
+    clearAllRemoteFileChannels("peer_connection_replaced")
+    clearAllRemoteRoomAppChannels("peer_connection_replaced")
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.cloudflare.com:3478" }],
+    })
+    peerConnectionRef.current = pc
+    pc.ontrack = (event) => {
+      const mid =
+        typeof event.transceiver?.mid === "string"
+          ? event.transceiver.mid
+          : null
+      const binding = mid ? remoteTrackBindingsRef.current.get(mid) : undefined
+      voiceDownstreamDiagnostic("ontrack_fired", {
+        ontrack_fired: 1,
+        received_track_kind: diagnosticTrackKind(event.track.kind),
+        remote_track_binding_present: binding ? 1 : 0,
+      })
+      if (!binding) {
+        sfuClientDiagnostic("remote_track_stale_event_ignored", {
+          track_kind: diagnosticTrackKind(event.track.kind),
+          reason: mid ? "binding_missing" : "mid_missing",
+        })
+        return
+      }
+      if (
+        binding.peerConnection !== pc ||
+        binding.subscriberSessionId !== sessionRef.current?.sessionId
+      ) {
+        sfuClientDiagnostic("remote_track_stale_event_ignored", {
+          track_kind: diagnosticTrackKind(event.track.kind),
+          reason:
+            binding.peerConnection === pc
+              ? "subscriber_session_stale"
+              : "peer_connection_replaced",
+        })
+        return
+      }
+      const participant = participantMapRef.current.get(binding.participantId)
+      if (participant?.media?.sessionId !== binding.publisherSessionId) {
+        removeRemoteTrackBinding(binding)
+        sfuClientDiagnostic("remote_track_stale_event_ignored", {
+          track_kind: diagnosticTrackKind(event.track.kind),
+          reason: "publisher_session_stale",
+        })
+        return
+      }
+      if (event.track.kind !== binding.kind) {
+        removeRemoteTrackBinding(binding)
+        sfuClientDiagnostic("remote_track_stale_event_ignored", {
+          track_kind: diagnosticTrackKind(event.track.kind),
+          reason: "track_kind_mismatch",
+        })
+        return
+      }
+      if (binding.timeout !== null) clearTimeout(binding.timeout)
+      remoteTrackBindingsRef.current.delete(binding.mid)
+      binding.attached = true
+      const stream = event.streams?.[0] ?? new MediaStream([event.track])
+      const streams =
+        binding.kind === "video"
+          ? remoteScreenStreamsRef.current
+          : remoteAudioStreamsRef.current
+      const previousStream = streams.get(binding.participantId)
+      if (previousStream && previousStream !== stream)
+        previousStream.getTracks().forEach((track) => track.stop())
+      streams.set(binding.participantId, stream)
+      sfuClientDiagnostic("remote_track_attached", {
+        participant_kind: diagnosticParticipantKind(participant.kind),
+        track_kind: binding.kind,
+      })
+      voiceDownstreamDiagnostic("stream_attached", {
+        stream_attached: 1,
+        attached_kind: binding.kind,
+        remote_audio_stream_count: remoteAudioStreamsRef.current.size,
+      })
+      rebuildParticipants()
+    }
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "connected") {
+        mediaReconnectAttemptsRef.current = 0
+        setConnectionStatus("connected")
+        sampleSfuEgress("interval", pc)
+        // Room state and ICE/DTLS completion are independent events. Replay
+        // all currently published remote media at this boundary so an early
+        // state notification cannot permanently lose a subscription.
+        resubscribeRemoteMedia()
+      } else if (
+        pc.connectionState === "failed" ||
+        pc.connectionState === "disconnected"
+      ) {
+        sampleSfuEgress("disconnect", pc)
+        void mediaReconnectRef.current?.()
+      }
+    }
+    return pc
+  }, [
+    clearAllRemoteFileChannels,
+    clearAllRemoteRoomAppChannels,
+    clearAllRemoteTrackSubscriptionRetries,
+    clearRemoteTrackBindings,
+    rebuildParticipants,
+    removeRemoteTrackBinding,
+    resubscribeRemoteMedia,
+    sampleSfuEgress,
+  ])
+
+  const connectWebSocket = useCallback(() => {
+    const session = sessionRef.current
+    if (!session || closingRef.current) return
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:"
+    const url = new URL(`${protocol}//${window.location.host}/api/sfu/ws`)
+    url.searchParams.set("room", session.room)
+    url.searchParams.set("participantId", session.participantId)
+    url.searchParams.set("token", session.participantToken)
+    const socket = new WebSocket(url)
+    websocketRef.current = socket
+    socket.onopen = () => {
+      reconnectAttemptsRef.current = 0
+      setConnectionStatus("connected")
+      setError("")
+      sendSocketMessage({ type: "resync" })
+      if (dataChannelReadyRef.current)
+        sendSocketMessage({
+          type: "datachannel-ready",
+          appDataChannelReady: roomAppChannelsReadyRef.current,
+        })
+    }
+    socket.onmessage = (event) => {
+      const message = JSON.parse(event.data) as SfuServerMessage
+      if (message.type === "state" && message.state) {
+        applyRoomState(message.state)
+      } else if (message.type === "room-app-unicast") {
+        const envelope = decodeRoomAppUnicastEnvelope(message, roomName)
+        if (!envelope) return
+        for (const listener of roomAppUnicastListenersRef.current)
+          listener(envelope)
+      } else if (message.type === "room-app-unicast-result") {
+        const result = decodeRoomAppUnicastResult(message, roomName)
+        if (!result) return
+        for (const listener of roomAppUnicastResultListenersRef.current)
+          listener(result)
+      } else if (message.type === "agentActivity") {
+        if (message.activity) {
+          const next = [
+            ...agentActivitiesRef.current.filter(
+              (activity) =>
+                !(
+                  activity.agentParticipantId ===
+                    message.activity!.agentParticipantId &&
+                  activity.scopeId === message.activity!.scopeId
+                )
+            ),
+            message.activity,
+          ]
+          agentActivitiesRef.current = next
+          setAgentActivities(next)
+          rebuildParticipants()
+        } else if (message.agentParticipantId && message.scopeId) {
+          const next = agentActivitiesRef.current.filter(
+            (activity) =>
+              !(
+                activity.agentParticipantId === message.agentParticipantId &&
+                activity.scopeId === message.scopeId
+              )
+          )
+          agentActivitiesRef.current = next
+          setAgentActivities(next)
+          rebuildParticipants()
+        }
+      } else if (
+        message.type === "trackPublished" &&
+        message.participant?.track
+      ) {
+        const participantId = message.participant.id
+        const incomingSessionId = message.participant.sessionId
+        const current = participantId
+          ? participantMapRef.current.get(participantId)
+          : undefined
+        voiceDownstreamDiagnostic("track_published_received", {
+          track_published_received: 1,
+          participant_kind: diagnosticParticipantKind(message.participant.kind),
+          track_kind: diagnosticTrackKind(message.participant.track.kind),
+          participant_found: current ? 1 : 0,
+          publisher_session_present: incomingSessionId ? 1 : 0,
+        })
+        if (!participantId) return
+        if (
+          current &&
+          incomingSessionId &&
+          current.media?.sessionId !== incomingSessionId
+        ) {
+          resetRemoteParticipant(participantId)
+          if (current.media) {
+            current.media = {
+              ...current.media,
+              sessionId: incomingSessionId,
+              fileChannelReady: false,
+              tracks: [message.participant.track],
+            }
+          } else {
+            // Human resync missed the agent-media-attach state broadcast;
+            // bootstrap from the publication so subscribe can proceed.
+            current.media = {
+              sessionId: incomingSessionId,
+              muted: false,
+              fileChannelReady: false,
+              tracks: [message.participant.track],
+            }
+          }
+        } else if (current) {
+          if (!current.media) {
+            if (!incomingSessionId) return
+            current.media = {
+              sessionId: incomingSessionId,
+              muted: false,
+              fileChannelReady: false,
+              tracks: [message.participant.track],
+            }
+          } else {
+            const existingTrack = current.media.tracks.find(
+              (track) =>
+                track.trackName === message.participant!.track!.trackName &&
+                track.kind === message.participant!.track!.kind
+            )
+            const subscriptionKey = incomingSessionId
+              ? `${participantId}:${incomingSessionId}:${message.participant.track.trackName}`
+              : null
+            const hasActiveBinding = subscriptionKey
+              ? [...remoteTrackBindingsRef.current.values()].some(
+                  (binding) => binding.subscriptionKey === subscriptionKey
+                )
+              : false
+            const hasExistingStream =
+              message.participant.track.kind === "video"
+                ? remoteScreenStreamsRef.current.has(participantId)
+                : remoteAudioStreamsRef.current.has(participantId)
+            if (
+              existingTrack &&
+              incomingSessionId &&
+              (hasActiveBinding || hasExistingStream)
+            )
+              resetRemoteTrackSubscription(
+                participantId,
+                incomingSessionId,
+                message.participant.track.trackName,
+                message.participant.track.kind
+              )
+            current.media.tracks = [
+              ...current.media.tracks.filter(
+                (track) =>
+                  track.trackName !== message.participant!.track!.trackName
+              ),
+              message.participant.track,
+            ]
+          }
+        } else if (message.participant.name && incomingSessionId) {
+          participantMapRef.current.set(participantId, {
+            id: participantId,
+            name: message.participant.name,
+            kind: message.participant.kind ?? "human",
+            connected: true,
+            media: {
+              sessionId: incomingSessionId,
+              muted: false,
+              fileChannelReady: false,
+              tracks: [message.participant.track],
+            },
+            joinedAt: Date.now(),
+            lastSeenAt: Date.now(),
+            token: "",
+          })
+        }
+        const participant = participantMapRef.current.get(participantId)
+        rebuildParticipants()
+        if (participant)
+          void subscribeTrack(participant, message.participant.track)
+      } else if (
+        message.type === "participantUpdated" &&
+        message.participant?.id
+      ) {
+        const participant = participantMapRef.current.get(
+          message.participant.id
+        )
+        if (
+          participant?.media &&
+          typeof message.participant.muted === "boolean"
+        ) {
+          participant.media.muted = message.participant.muted
+          rebuildParticipants()
+        }
+        if (
+          participant?.media &&
+          message.participant.fileChannelReady === true
+        ) {
+          participant.media.fileChannelReady = true
+          void subscribeFileChannel(participant)
+          rebuildParticipants()
+        }
+        if (
+          participant?.media &&
+          message.participant.appDataChannelReady === true
+        ) {
+          participant.media.appDataChannelReady = true
+          void subscribeRoomAppChannel(participant, "reliable")
+          void subscribeRoomAppChannel(participant, "realtime")
+          rebuildParticipants()
+        }
+      } else if (message.type === "message" && message.message) {
+        const localParticipantId = sessionRef.current?.participantId
+        appendRoomMessage(
+          roomMessageToMessage(message.message, localParticipantId)
+        )
+      } else if (message.type === "attachment" && message.attachment) {
+        const attachment = message.attachment
+        const currentAttachments = attachmentsRef.current
+        if (!currentAttachments.some((entry) => entry.id === attachment.id)) {
+          const nextAttachments = [...currentAttachments, attachment]
+          attachmentsRef.current = nextAttachments
+          setAttachments(nextAttachments)
+        }
+      } else if (message.type === "expired") {
+        setError(
+          "This room has closed after being empty for a while. Please open a new room."
+        )
+        setConnectionStatus("failed")
+      } else if (message.type === "error") {
+        // A provider-claim request has no optimistic success path. Reject
+        // any pending private claim immediately instead of letting its raw
+        // browser-local secret sit around until the timeout.
+        for (const pending of pendingRuntimeProviderClaimsRef.current.values()) {
+          clearTimeout(pending.timeout)
+          pending.reject(new Error(userFacingRoomError(message.error)))
+        }
+        pendingRuntimeProviderClaimsRef.current.clear()
+        runtimeProviderClaimAttemptRef.current = null
+        setError(userFacingRoomError(message.error))
+      } else if (
+        message.type === "runtime-provider-claim-created" &&
+        message.requestId
+      ) {
+        const pending = pendingRuntimeProviderClaimsRef.current.get(
+          message.requestId
+        )
+        if (!pending) return
+        pendingRuntimeProviderClaimsRef.current.delete(message.requestId)
+        clearTimeout(pending.timeout)
+        if (runtimeProviderClaimAttemptRef.current)
+          runtimeProviderClaimAttemptRef.current.expiresAt =
+            message.expiresAt ?? Date.now() + 5 * 60 * 1000
+        pending.resolve({ providerClaimSecret: pending.providerClaimSecret })
+      }
+    }
+    socket.onerror = () => socket.close()
+    socket.onclose = () => {
+      for (const pending of pendingRuntimeProviderClaimsRef.current.values()) {
+        clearTimeout(pending.timeout)
+        pending.reject(new Error("Room control connection closed"))
+      }
+      pendingRuntimeProviderClaimsRef.current.clear()
+      runtimeProviderClaimAttemptRef.current = null
+      if (closingRef.current) return
+      if (socket !== websocketRef.current) return
+      setConnectionStatus("reconnecting")
+      const attempt = reconnectAttemptsRef.current++
+      if (attempt >= 5) {
+        setError("SFU connection lost. Reload to start a new session.")
+        setConnectionStatus("failed")
+        return
+      }
+      reconnectTimerRef.current = setTimeout(
+        connectWebSocket,
+        Math.min(1000 * 2 ** attempt, 8000)
+      )
+    }
+  }, [
+    appendRoomMessage,
+    applyRoomState,
+    rebuildParticipants,
+    resetRemoteParticipant,
+    resetRemoteTrackSubscription,
+    roomName,
+    sendSocketMessage,
+    subscribeFileChannel,
+    subscribeRoomAppChannel,
+    subscribeTrack,
+  ])
+
+  const connectMediaSession = useCallback(
+    async (reconnecting: boolean) => {
+      const previousSession = sessionRef.current
+      if (reconnecting && !previousSession)
+        throw new Error("SFU session is not ready")
+
+      if (reconnecting) {
+        if (reconnectTimerRef.current) {
+          clearTimeout(reconnectTimerRef.current)
+          reconnectTimerRef.current = null
+        }
+        const oldSocket = websocketRef.current
+        if (oldSocket) {
+          oldSocket.onclose = null
+          oldSocket.onerror = null
+          oldSocket.close()
+          websocketRef.current = null
+        }
+        await closeDataChannels(previousSession)
+        clearAllRemoteFileChannels("media_reconnect")
+        clearAllRemoteRoomAppChannels("media_reconnect")
+        clearRemoteTrackBindings()
+        for (const channel of dataChannelsRef.current) channel.close()
+        dataChannelsRef.current.clear()
+        dataChannelIdsRef.current.clear()
+        incomingFilesRef.current.clear()
+        localFileChannelRef.current = null
+        localFileChannelIdRef.current = null
+        localRoomAppChannelsRef.current.clear()
+        roomAppsServerEnabledRef.current = false
+        roomAppChannelsReadyRef.current = false
+        const oldPeerConnection = peerConnectionRef.current
+        if (oldPeerConnection) {
+          sampleSfuEgress("disconnect", oldPeerConnection)
+          oldPeerConnection.close()
+        }
+        peerConnectionRef.current = null
+        dataChannelReadyRef.current = false
+        roomAppsEnabledRef.current = false
+        localTrackMidsRef.current.clear()
+        clearAllAgentAudioSubscriptionRetries("media_reconnect")
+        clearAllRemoteTrackSubscriptionRetries("media_reconnect")
+        subscribedTracksRef.current.clear()
+        readySubscribedTracksRef.current.clear()
+        remoteAudioStreamsRef.current.clear()
+        remoteScreenStreamsRef.current.clear()
+      }
+
+      // A fresh Human session must be Turnstile-verified; reconnects prove
+      // authorization with the previous participant/session id instead and
+      // never need — or trigger — a new challenge.
+      let turnstileToken: string | undefined
+      if (!reconnecting && getTurnstileToken) {
+        setConnectionStatus("verifying")
+        try {
+          turnstileToken = await getTurnstileToken()
+        } catch (err) {
+          throw new TurnstileVerificationError(
+            err instanceof Error ? err.message : "Verification failed"
+          )
+        }
+      }
+      setConnectionStatus(reconnecting ? "reconnecting" : "connecting")
+
+      let audioTrack = localAudioTrackRef.current
+      if (!audioTrack) {
+        const media = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: false,
+        })
+        audioTrack = media.getAudioTracks()[0] ?? null
+        if (!audioTrack) throw new Error("No microphone track available")
+        localAudioTrackRef.current = audioTrack
+      }
+
+      const pc = createPeerConnection()
+      addLocalMediaTrack(pc, audioTrack, new MediaStream([audioTrack]))
+      const screenTrack = localScreenTrackRef.current
+      if (screenTrack && screenTrack.readyState === "live")
+        addLocalMediaTrack(pc, screenTrack, new MediaStream([screenTrack]))
+      rebuildParticipants()
+
+      const body: Record<string, unknown> = {
+        room: roomName,
+        name: nickName,
+        kind: "human",
+        turnstileToken,
+      }
+      const reattach = readOrCreateRuntimeReattachSecret(roomName)
+      if (reattach.existed && reattach.secret) {
+        body.runtimeProviderReattachProofHash =
+          await deriveRuntimeProviderReattachHash(roomName, reattach.secret)
+      }
+      if (reconnecting && previousSession) {
+        body.reconnect = {
+          participantId: previousSession.participantId,
+          participantToken: previousSession.participantToken,
+          sessionId: previousSession.sessionId,
+        }
+      }
+      const response = await fetch("/api/sfu/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      })
+      if (!response.ok) {
+        const data = (await response.json().catch(() => ({}))) as {
+          error?: string
+        }
+        if (!reconnecting && response.status === 403) {
+          throw new TurnstileVerificationError(
+            data.error || "Verification failed"
+          )
+        }
+        throw new Error(data.error || "Unable to create SFU session")
+      }
+      const session = (await response.json()) as SfuSessionResponse
+      sessionRef.current = { ...session, room: roomName }
+      roomAppsServerEnabledRef.current = session.roomAppsEnabled === true
+      roomAppsEnabledRef.current = false
+      setRoomAppsEnabled(false)
+      await establishDataChannelTransport()
+      await publishTrack(audioTrack, "audio", `audio-${session.participantId}`)
+      if (screenTrack && screenTrack.readyState === "live") {
+        await publishTrack(
+          screenTrack,
+          "video",
+          localScreenTrackNameRef.current
+        )
+      }
+      connectWebSocket()
+    },
+    [
+      closeDataChannels,
+      clearAllAgentAudioSubscriptionRetries,
+      clearAllRemoteTrackSubscriptionRetries,
+      clearAllRemoteFileChannels,
+      clearAllRemoteRoomAppChannels,
+      clearRemoteTrackBindings,
+      connectWebSocket,
+      createPeerConnection,
+      establishDataChannelTransport,
+      getTurnstileToken,
+      nickName,
+      publishTrack,
+      rebuildParticipants,
+      roomName,
+      sampleSfuEgress,
+    ]
+  )
+
+  const reconnectMedia = useCallback(async () => {
+    if (closingRef.current || mediaReconnectPromiseRef.current) return
+    const attempt = mediaReconnectAttemptsRef.current++
+    if (attempt >= 5) {
+      setError("SFU media connection lost. Reload to start a new session.")
+      setConnectionStatus("failed")
+      return
+    }
+    const promise = (async () => {
+      setConnectionStatus("reconnecting")
+      try {
+        await connectMediaSession(true)
+        mediaReconnectAttemptsRef.current = 0
+        setError("")
+      } catch (err) {
+        if (attempt >= 4) {
+          setError(
+            err instanceof Error
+              ? err.message
+              : "Unable to reconnect to SFU media"
+          )
+          setConnectionStatus("failed")
+          return
+        }
+        mediaReconnectTimerRef.current = setTimeout(() => {
+          void mediaReconnectRef.current?.()
+        }, Math.min(1000 * 2 ** attempt, 8000))
+      }
+    })()
+    mediaReconnectPromiseRef.current = promise
+    try {
+      await promise
+    } finally {
+      mediaReconnectPromiseRef.current = null
+    }
+  }, [connectMediaSession])
+
+  useEffect(() => {
+    if (!enabled || !roomName || !nickName) return
+    closingRef.current = false
+    const start = async () => {
+      try {
+        await connectMediaSession(false)
+      } catch (err) {
+        if (err instanceof TurnstileVerificationError) {
+          setError(err.message)
+          setConnectionStatus("verification_failed")
+          return
+        }
+        setError(
+          err instanceof Error ? err.message : "Unable to connect to SFU"
+        )
+        setConnectionStatus("failed")
+      }
+    }
+    mediaReconnectRef.current = reconnectMedia
+    initialConnectRef.current = start
+    sfuEgressTimerRef.current = window.setInterval(() => {
+      const peerConnection = peerConnectionRef.current
+      if (peerConnection?.connectionState === "connected")
+        sampleSfuEgress("interval", peerConnection)
+    }, SFU_EGRESS_SAMPLE_INTERVAL_MS)
+    const handlePageHide = () => {
+      sampleSfuEgress("pagehide", peerConnectionRef.current)
+    }
+    window.addEventListener("pagehide", handlePageHide)
+    void start()
+
+    const remoteFileChannels = remoteFileChannelsRef.current
+    const remoteFileChannelIds = remoteFileChannelIdsRef.current
+    const incomingFiles = incomingFilesRef.current
+    const objectUrls = objectUrlsRef.current
+    const dataChannels = dataChannelsRef.current
+    const localTrackMids = localTrackMidsRef.current
+    const localRoomAppChannels = localRoomAppChannelsRef.current
+
+    return () => {
+      closingRef.current = true
+      sampleSfuEgress("disconnect", peerConnectionRef.current)
+      clearAllAgentAudioSubscriptionRetries("unmount")
+      clearAllRemoteTrackSubscriptionRetries("unmount")
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current)
+      if (mediaReconnectTimerRef.current)
+        clearTimeout(mediaReconnectTimerRef.current)
+      if (sfuEgressTimerRef.current) {
+        clearInterval(sfuEgressTimerRef.current)
+        sfuEgressTimerRef.current = null
+      }
+      window.removeEventListener("pagehide", handlePageHide)
+      void closeDataChannels(sessionRef.current)
+      clearAllRemoteFileChannels("unmount")
+      clearAllRemoteRoomAppChannels("unmount")
+      clearRemoteTrackBindings()
+      websocketRef.current?.close()
+      localAudioTrackRef.current?.stop()
+      localScreenTrackRef.current?.stop()
+      localFileChannelRef.current?.close()
+      localFileChannelRef.current = null
+      for (const channel of localRoomAppChannels.values()) channel.close()
+      localRoomAppChannels.clear()
+      roomAppsServerEnabledRef.current = false
+      roomAppChannelsReadyRef.current = false
+      roomAppsEnabledRef.current = false
+      for (const channel of dataChannels) channel.close()
+      dataChannels.clear()
+      for (const channel of remoteFileChannels.values()) channel.close()
+      remoteFileChannels.clear()
+      remoteFileChannelIds.clear()
+      localFileChannelIdRef.current = null
+      incomingFiles.clear()
+      for (const url of objectUrls) URL.revokeObjectURL(url)
+      objectUrls.clear()
+      roomMessagesRef.current = []
+      attachmentsRef.current = []
+      ephemeralMessagesRef.current = []
+      dataChannelReadyRef.current = false
+      localTrackMids.clear()
+      mediaReconnectRef.current = null
+      initialConnectRef.current = null
+      peerConnectionRef.current?.close()
+      peerConnectionRef.current = null
+    }
+  }, [
+    closeDataChannels,
+    clearAllAgentAudioSubscriptionRetries,
+    clearAllRemoteTrackSubscriptionRetries,
+    clearAllRemoteFileChannels,
+    clearAllRemoteRoomAppChannels,
+    connectMediaSession,
+    clearRemoteTrackBindings,
+    enabled,
+    nickName,
+    reconnectMedia,
+    roomName,
+    sampleSfuEgress,
+    sendSocketMessage,
+  ])
+
+  const muteSelf = useCallback(() => {
+    const track = localAudioTrackRef.current
+    if (!track) return
+    track.enabled = !track.enabled
+    sendSocketMessage({ type: "mute", muted: !track.enabled })
+    rebuildParticipants()
+  }, [rebuildParticipants, sendSocketMessage])
+
+  const toggleScreenShare = useCallback(async () => {
+    const pc = peerConnectionRef.current
+    const session = sessionRef.current
+    if (!pc || !session) return
+    if (localScreenTrackRef.current) {
+      const trackName = localScreenTrackNameRef.current
+      const track = localScreenTrackRef.current
+      track.onended = null
+      try {
+        await closePublishedTrack(trackName)
+      } catch {
+        sendSocketMessage({ type: "unpublish", trackName })
+      }
+      track.stop()
+      localScreenTrackRef.current = null
+      rebuildParticipants()
+      return
+    }
+    try {
+      const display = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: false,
+      })
+      const track = display.getVideoTracks()[0]
+      if (!track) return
+      localScreenTrackRef.current = track
+      localScreenTrackNameRef.current = `screen-${session.participantId}`
+      addLocalMediaTrack(pc, track, display)
+      track.onended = () => {
+        if (localScreenTrackRef.current === track) {
+          void closePublishedTrack(localScreenTrackNameRef.current)
+            .catch(() => {
+              sendSocketMessage({
+                type: "unpublish",
+                trackName: localScreenTrackNameRef.current,
+              })
+            })
+            .finally(() => {
+              localScreenTrackRef.current = null
+              rebuildParticipants()
+            })
+        }
+      }
+      rebuildParticipants()
+      await publishTrack(track, "video", localScreenTrackNameRef.current)
+    } catch (err) {
+      if (localScreenTrackRef.current && !closingRef.current) {
+        sfuClientDiagnostic("local_track_publish_failed", {
+          track_kind: "video",
+          error_type: diagnosticErrorType(err),
+        })
+        // A local tracks/new answer failure can leave this PeerConnection's
+        // SDP state unusable. Rebuild the whole media session so the Room
+        // state is re-advertised from a fresh PeerConnection instead of
+        // asking the poisoned one to negotiate a second video m-line.
+        void mediaReconnectRef.current?.()
+      }
+      setError(
+        err instanceof Error ? err.message : "Screen sharing was not started"
+      )
+    }
+  }, [
+    closePublishedTrack,
+    publishTrack,
+    rebuildParticipants,
+    sendSocketMessage,
+  ])
+
+  const sendTextMessage = useCallback(
+    (text: string, targets: string[] = [], taskRequestId?: string) => {
+      sendSocketMessage({
+        type: "chat",
+        text,
+        targets,
+        ...(taskRequestId ? { taskRequestId } : {}),
+      })
+    },
+    [sendSocketMessage]
+  )
+
+  const sendRoomAppMessage = useCallback(
+    (
+      lane: RoomAppLane,
+      appInstanceId: string,
+      payload: Record<string, unknown>
+    ): boolean => {
+      if (
+        !roomAppsEnabledRef.current ||
+        !roomAppChannelsReadyRef.current ||
+        !isRoomAppInstanceForRoom(roomName, appInstanceId)
+      )
+        return false
+      const encoded = encodeRoomAppEnvelope({
+        appInstanceId,
+        lane,
+        payload,
+      })
+      if (!encoded) return false
+      const bytes = new TextEncoder().encode(encoded).byteLength
+      if (!roomAppOutboundRateRef.current.allow(lane, bytes)) {
+        roomAppStatsRef.current.droppedMessages += 1
+        return false
+      }
+      const channel = localRoomAppChannelsRef.current.get(lane)
+      if (!channel || channel.readyState !== "open") return false
+      channel.send(encoded)
+      roomAppStatsRef.current.bytesSent += bytes
+      if (lane === "reliable") roomAppStatsRef.current.reliableMessages += 1
+      else roomAppStatsRef.current.realtimeMessages += 1
+      return true
+    },
+    [roomName]
+  )
+
+  const sendRoomAppUnicast = useCallback(
+    (
+      requestId: string,
+      targetParticipantId: string,
+      appInstanceId: string,
+      payload: Record<string, unknown>
+    ):
+      | "sent"
+      | "rate_limited"
+      | "payload_too_large"
+      | "delivery_unavailable" => {
+      if (
+        !roomAppsEnabledRef.current ||
+        !isRoomAppInstanceForRoom(roomName, appInstanceId)
+      )
+        return "delivery_unavailable"
+      const encoded = encodeRoomAppUnicastRequest({
+        requestId,
+        targetParticipantId,
+        appInstanceId,
+        payload,
+      })
+      if (!encoded) return "payload_too_large"
+      const bytes = new TextEncoder().encode(encoded).byteLength
+      if (!roomAppUnicastRateRef.current.allow(bytes)) return "rate_limited"
+      let message: object
+      try {
+        message = JSON.parse(encoded) as object
+      } catch {
+        return "payload_too_large"
+      }
+      return sendSocketMessage(message) ? "sent" : "delivery_unavailable"
+    },
+    [roomName, sendSocketMessage]
+  )
+
+  const subscribeRoomAppMessages = useCallback(
+    (listener: (message: RoomAppTransportEnvelope) => void) => {
+      roomAppListenersRef.current.add(listener)
+      return () => roomAppListenersRef.current.delete(listener)
+    },
+    []
+  )
+
+  const subscribeRoomAppUnicast = useCallback(
+    (listener: (message: RoomAppUnicastEnvelope) => void) => {
+      roomAppUnicastListenersRef.current.add(listener)
+      return () => roomAppUnicastListenersRef.current.delete(listener)
+    },
+    []
+  )
+
+  const subscribeRoomAppUnicastResults = useCallback(
+    (listener: (result: RoomAppUnicastResult) => void) => {
+      roomAppUnicastResultListenersRef.current.add(listener)
+      return () => roomAppUnicastResultListenersRef.current.delete(listener)
+    },
+    []
+  )
+
+  const getRoomAppStats = useCallback(
+    (): RoomAppTransportStats => ({ ...roomAppStatsRef.current }),
+    []
+  )
+
+  const sendActionMessage = useCallback(
+    (actionType: ActionType, actionPayload: Record<string, string>) => {
+      sendSocketMessage({ type: "action", actionType, actionPayload })
+    },
+    [sendSocketMessage]
+  )
+
+  // #305: Human-originated task entry. This is deliberately only a thin
+  // socket seam; the Room derives the sender, validates the connected Agent,
+  // generates the requestId, and appends the canonical collaboration event.
+  const sendCollabRequest = useCallback(
+    (targetParticipantId: string, summary: string): boolean => {
+      const target = targetParticipantId.trim()
+      const instruction = summary.trim()
+      if (!target || !instruction) return false
+      if (websocketRef.current?.readyState !== WebSocket.OPEN) return false
+      sendSocketMessage({
+        type: "collab-request",
+        targetParticipantId: target,
+        summary: instruction.slice(0, MAX_COLLAB_SUMMARY_LENGTH),
+      })
+      return true
+    },
+    [sendSocketMessage]
+  )
+
+  // #117: authenticated Human on-demand read of one existing room
+  // collaboration artifact. Credentials ride in request headers only; the
+  // response is validated strictly (id match, MIME allow-list, size bounds,
+  // exact base64 length) before it can reach any UI. Nothing is cached here.
+  const readRoomAttachment = useCallback(
+    async (attachmentId: string): Promise<RoomAttachmentRead> => {
+      if (!attachmentId) throw new Error("attachmentId is required")
+      const session = sessionRef.current
+      if (!session) throw new Error("Not connected to the room")
+      const response = await fetch("/api/room/attachments/read", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Room-Id": session.room,
+          "X-Room-Participant-Id": session.participantId,
+          "X-Room-Participant-Token": session.participantToken,
+        },
+        body: JSON.stringify({ attachmentId }),
+      })
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => ({}))) as {
+          error?: unknown
+        }
+        throw new Error(
+          typeof payload.error === "string"
+            ? payload.error
+            : `attachment_read_failed_${response.status}`
+        )
+      }
+      const payload = (await response.json().catch(() => null)) as unknown
+      const validated = validateRoomAttachmentRead(payload, attachmentId)
+      if (validated.ok === false)
+        throw new Error(`invalid_attachment_payload: ${validated.error}`)
+      return validated.read
+    },
+    []
+  )
+
+  // #115: Human accepted/declined for an Agent-originated request addressed
+  // to this participant. Returns false when the socket is closed or inputs
+  // are invalid — never claims success without sending. The canonical state
+  // arrives via the ordinary broadcast (no optimistic echo).
+  const sendCollabResponse = useCallback(
+    (
+      requestId: string,
+      decision: "accepted" | "declined",
+      summary?: string
+    ): boolean => {
+      if (!requestId) return false
+      if (websocketRef.current?.readyState !== WebSocket.OPEN) return false
+      const trimmed = summary?.trim()
+      sendSocketMessage({
+        type: "collab-response",
+        requestId,
+        decision,
+        ...(trimmed
+          ? { summary: trimmed.slice(0, MAX_COLLAB_SUMMARY_LENGTH) }
+          : {}),
+      })
+      return true
+    },
+    [sendSocketMessage]
+  )
+
+  // #121: Human terminal result (completed | failed) for an
+  // Agent-originated request this Human accepted. Returns false when the
+  // socket is closed or inputs are invalid — never claims success without
+  // sending. Canonical state arrives via the ordinary broadcast.
+  const sendCollabResult = useCallback(
+    (
+      requestId: string,
+      status: "completed" | "failed",
+      summary: string
+    ): boolean => {
+      if (!requestId) return false
+      if (status !== "completed" && status !== "failed") return false
+      const trimmed = summary.trim()
+      if (!trimmed || trimmed.length > MAX_COLLAB_SUMMARY_LENGTH) return false
+      if (websocketRef.current?.readyState !== WebSocket.OPEN) return false
+      sendSocketMessage({
+        type: "collab-result",
+        requestId,
+        status,
+        summary: trimmed,
+      })
+      return true
+    },
+    [sendSocketMessage]
+  )
+
+  // #286: an approval is a structured authenticated Room action. The server
+  // derives the Human identity and the target Agent from Room state; this
+  // client only submits the request and the exact native option id.
+  const sendPermissionResponse = useCallback(
+    (requestId: string, selectedOptionId: string): boolean => {
+      const request = requestId.trim()
+      const option = selectedOptionId.trim()
+      if (!request || !option) return false
+      if (websocketRef.current?.readyState !== WebSocket.OPEN) return false
+      sendSocketMessage({
+        type: "permission-response",
+        requestId: request,
+        selectedOptionId: option,
+      })
+      return true
+    },
+    [sendSocketMessage]
+  )
+
+  const startLiveTranscript = useCallback(
+    (runtimeHostId: string) => {
+      sendSocketMessage({
+        type: "live-transcript-start",
+        runtimeHostId,
+      })
+    },
+    [sendSocketMessage]
+  )
+
+  const stopLiveTranscript = useCallback(() => {
+    sendSocketMessage({ type: "live-transcript-stop" })
+  }, [sendSocketMessage])
+
+  const leaveRoom = useCallback(() => {
+    sampleSfuEgress("leave", peerConnectionRef.current)
+    sendSocketMessage({ type: "leave" })
+  }, [sampleSfuEgress, sendSocketMessage])
+
+  const setAgentVoice = useCallback(
+    (agentParticipantId: string, enabled: boolean) => {
+      sendSocketMessage({
+        type: "agent-voice-set",
+        agentParticipantId,
+        enabled,
+      })
+    },
+    [sendSocketMessage]
+  )
+
+  // Create one browser-local connection attempt at a time. The raw claim is
+  // never rendered; the dedicated Runtime handoff copies it only inside a
+  // local CLI command after the Room ACKs the hash.
+  const createRuntimeProviderClaim = useCallback(async (): Promise<{
+    providerClaimSecret: string
+  }> => {
+    const existing = runtimeProviderClaimAttemptRef.current
+    if (
+      existing &&
+      existing.room === roomName &&
+      existing.expiresAt > Date.now()
+    )
+      return existing.promise
+
+    const promise = (async () => {
+      const credential = await createRuntimeProviderCredential(roomName)
+      const reattach = readOrCreateRuntimeReattachSecret(roomName)
+      const reattachProofHash = reattach.secret
+        ? await deriveRuntimeProviderReattachHash(roomName, reattach.secret)
+        : undefined
+      const requestId = crypto.randomUUID()
+      return new Promise<{ providerClaimSecret: string }>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          const pending = pendingRuntimeProviderClaimsRef.current.get(requestId)
+          if (!pending) return
+          pendingRuntimeProviderClaimsRef.current.delete(requestId)
+          runtimeProviderClaimAttemptRef.current = null
+          reject(new Error("Room provider claim was not acknowledged"))
+        }, 5_000)
+        pendingRuntimeProviderClaimsRef.current.set(requestId, {
+          providerClaimSecret: credential.providerClaimSecret,
+          resolve,
+          reject,
+          timeout,
+        })
+        if (
+          !sendSocketMessage({
+            type: "runtime-provider-claim-create",
+            requestId,
+            providerClaimHash: credential.providerClaimHash,
+            ...(reattachProofHash ? { reattachProofHash } : {}),
+          })
+        ) {
+          pendingRuntimeProviderClaimsRef.current.delete(requestId)
+          clearTimeout(timeout)
+          runtimeProviderClaimAttemptRef.current = null
+          reject(new Error("Room control connection is unavailable"))
+        }
+      })
+    })()
+    runtimeProviderClaimAttemptRef.current = {
+      room: roomName,
+      promise,
+      expiresAt: Date.now() + 5 * 60 * 1000,
+    }
+    void promise.catch(() => {
+      if (runtimeProviderClaimAttemptRef.current?.promise === promise)
+        runtimeProviderClaimAttemptRef.current = null
+    })
+    return promise
+  }, [roomName, sendSocketMessage])
+
+  const connectLocalRuntime = useCallback(async () => {
+    setRuntimeConnectionStatus("preparing")
+    try {
+      const { providerClaimSecret } = await createRuntimeProviderClaim()
+      const shellQuote = (value: string) =>
+        `'${value.replaceAll("'", `'\\''`)}'`
+      const command = `free4chat-agent connect --room ${shellQuote(
+        roomName
+      )} --provider-claim ${shellQuote(providerClaimSecret)}`
+      if (!navigator.clipboard?.writeText)
+        throw new Error("clipboard_unavailable")
+      await navigator.clipboard.writeText(command)
+      setRuntimeConnectionStatus("copied")
+    } catch {
+      setRuntimeConnectionStatus("idle")
+      throw new Error("Unable to connect the local Runtime")
+    }
+  }, [createRuntimeProviderClaim, roomName])
+
+  /** #363 review (point 1): a bounded Agent-readable copy applies to a
+   * supported image/text-like file while at least one Agent is connected. */
+  const agentReadableCopyApplies = useCallback((file: File): boolean => {
+    if (!sessionRef.current) return false
+    const hasConnectedAgent = [...participantMapRef.current.values()].some(
+      (participant) => participant.kind === "agent" && participant.connected
+    )
+    return hasConnectedAgent && (isAgentImage(file) || isAgentTextFile(file))
+  }, [])
+
+  /** #363 review (point 1): publish the bounded Agent-readable copy of one
+   * Human Room file. This resolves only once the Room has accepted it, which
+   * is what the composer's release edge waits for — never the whole 20 MB
+   * DataChannel transfer. */
+  const publishAgentReadableCopy = useCallback(
+    async (session: SfuSession, file: File): Promise<void> => {
+      let uploadType = file.type
+      let uploadBody: ArrayBuffer | Blob = file
+      if (isAgentImage(file)) {
+        const visionCopy = await createAgentVisionCopy(file)
+        uploadType = visionCopy.type || file.type
+        uploadBody = await visionCopy.arrayBuffer()
+      } else {
+        uploadType = agentTextMime(file) ?? file.type
+      }
+      const response = await fetch("/api/room/attachments", {
+        method: "POST",
+        headers: {
+          "Content-Type": uploadType,
+          "X-Room-Id": roomName,
+          "X-Room-Participant-Id": session.participantId,
+          "X-Room-Participant-Token": session.participantToken,
+          "X-File-Name": encodeURIComponent(file.name.slice(0, 256)),
+        },
+        body: uploadBody,
+      })
+      if (!response.ok)
+        throw new Error("Couldn't publish the Agent-readable copy of this file")
+    },
+    [roomName]
+  )
+
+  const sendFileMessage = useCallback(
+    async (file: File, hooks?: RoomFileSendHooks) => {
+      // Allocate the transfer id before queueing so the queued wire messages
+      // and the eventual local bubble share one stable identity.
+      const id = crypto.randomUUID()
+      const mime = file.type || "application/octet-stream"
+      const send = async () => {
+        if (file.size > MAX_FILE_SIZE)
+          throw new Error("File exceeds the 20 MB limit")
+        const channel = localFileChannelRef.current
+        if (!channel) throw new Error("SFU file data channel is unavailable")
+        await waitForDataChannelOpen(channel)
+        // Capture the latest Room sequence observed by this browser directly
+        // before file-start. A queued file must not claim a causal position
+        // before the preceding transfer has actually started.
+        const afterSequence = latestObservedRoomSequence()
+        channel.send(
+          JSON.stringify({
+            type: "file-start",
+            id,
+            name: file.name,
+            mime,
+            size: file.size,
+            afterSequence,
+          })
+        )
+        // #363 review (point 1): decide the bounded Agent-readable copy up
+        // front and publish it concurrently with the Human transfer, so the
+        // composer's release edge never waits for the whole 20 MB transfer. A
+        // file with no applicable bounded copy keeps today's plain initiation
+        // edge, and a failed applicable copy is reported truthfully instead of
+        // silently releasing the text.
+        const copyApplies = agentReadableCopyApplies(file)
+        const copySession = sessionRef.current
+        if (copyApplies && copySession) {
+          void publishAgentReadableCopy(copySession, file).then(
+            () => hooks?.onReadiness?.(),
+            (error: unknown) => hooks?.onReadiness?.(error)
+          )
+        } else {
+          hooks?.onReadiness?.()
+        }
+        for (let offset = 0; offset < file.size; offset += FILE_CHUNK_SIZE) {
+          await waitForSendCapacity(channel)
+          const chunk = await file
+            .slice(offset, offset + FILE_CHUNK_SIZE)
+            .arrayBuffer()
+          channel.send(chunk)
+        }
+        await waitForSendCapacity(channel)
+        channel.send(JSON.stringify({ type: "file-end", id }))
+        const fileLink = URL.createObjectURL(file)
+        objectUrlsRef.current.add(fileLink)
+        appendEphemeralMessage({
+          peerId: LOCAL_PEER_ID,
+          name: nickName,
+          type: mime.startsWith("image/") ? "image" : "file",
+          messageId: id,
+          afterSequence,
+          fileLink,
+          fileName: file.name,
+          fileSize: file.size,
+        })
+        // Existing best-effort behaviour is preserved for the one case the
+        // release edge cannot cover: an Agent that only becomes connected while
+        // this transfer is already in flight still gets its bounded copy.
+        const lateSession = sessionRef.current
+        if (!copyApplies && lateSession && agentReadableCopyApplies(file))
+          void publishAgentReadableCopy(lateSession, file).catch(
+            () => undefined
+          )
+      }
+      const next = fileSendQueueRef.current.then(send, send)
+      fileSendQueueRef.current = next.then(
+        () => undefined,
+        () => undefined
+      )
+      return next
+    },
+    [
+      agentReadableCopyApplies,
+      appendEphemeralMessage,
+      latestObservedRoomSequence,
+      nickName,
+      publishAgentReadableCopy,
+      waitForDataChannelOpen,
+      waitForSendCapacity,
+    ]
+  )
+
+  // #363 A2: Human attachment inside an ACTIVE Task. This deliberately reuses
+  // the existing bounded, task-correlated Room attachment API (same 768 KB
+  // Agent-readable bound, same ephemeral Room store) instead of the 20 MB
+  // Human DataChannel transfer, and it always carries the exact active
+  // taskRequestId so the Room can fail closed on a stale or unknown Task.
+  //
+  // #363 second review: `wakeAgent` is the composer's explicit submission
+  // intent. It is persisted with the attachment so the Agent event can be
+  // rebuilt identically after a reconnect/replay: an attachment-only Task
+  // submission wakes the participating Task Agent(s), while an attachment +
+  // text submission keeps the attachment as Task context and leaves the
+  // following Task text as the single addressed wake boundary. The Room never
+  // derives this from the Task correlation alone.
+  const sendTaskAttachment = useCallback(
+    async (
+      file: File,
+      taskRequestId: string,
+      wakeAgent: boolean
+    ): Promise<void> => {
+      const requestId = taskRequestId.trim()
+      if (!requestId) throw new Error("This task is no longer active")
+      const session = sessionRef.current
+      if (!session) throw new Error("Not connected to the room")
+      if (file.size === 0) throw new Error("Empty files can't be attached")
+      let uploadType = agentTextMime(file)
+      let uploadBody: ArrayBuffer | Blob = file
+      if (isAgentImage(file)) {
+        // #363 review (point 2): the Agent-readable 768 KB bound applies to the
+        // DERIVED uploaded copy, not to the source screenshot — the same
+        // resize/re-encode the ordinary Room path uses. A normal multi-MB
+        // screenshot therefore works here too.
+        const visionCopy = await createAgentVisionCopy(file)
+        if (visionCopy.size > MAX_AGENT_ATTACHMENT_BYTES)
+          throw new Error("Task attachments are limited to 768 KB")
+        uploadType = visionCopy.type || file.type
+        uploadBody = await visionCopy.arrayBuffer()
+      } else if (file.size > MAX_AGENT_ATTACHMENT_BYTES) {
+        // A text-like source has no derived copy, so the raw Agent-readable
+        // bound still applies to it.
+        throw new Error("Task attachments are limited to 768 KB")
+      }
+      if (!uploadType)
+        throw new Error("Only images and text files can be attached to a task")
+      const response = await fetch("/api/room/attachments", {
+        method: "POST",
+        headers: {
+          "Content-Type": uploadType,
+          "X-Room-Id": roomName,
+          "X-Room-Participant-Id": session.participantId,
+          "X-Room-Participant-Token": session.participantToken,
+          "X-File-Name": encodeURIComponent(file.name.slice(0, 256)),
+          "X-Task-Request-Id": requestId,
+          [TASK_ATTACHMENT_WAKE_HEADER]: encodeTaskAttachmentWake(wakeAgent),
+        },
+        body: uploadBody,
+      })
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as {
+          error?: unknown
+        } | null
+        throw new Error(taskAttachmentErrorMessage(payload?.error))
+      }
+    },
+    [roomName]
+  )
+
+  const retryVerification = useCallback(() => {
+    if (closingRef.current) return
+    setError("")
+    void initialConnectRef.current?.()
+  }, [])
+
+  // #111: credentials for the LOCAL participant, used to authenticate
+  // on-demand workspace-snapshot reads. Never leaves the client except in
+  // request headers to this room's own Worker/DO.
+  const getLocalRoomAuth = useCallback(() => {
+    const session = sessionRef.current
+    if (!session) return null
+    return {
+      roomId: session.room,
+      participantId: session.participantId,
+      token: session.participantToken,
+    }
+  }, [])
+
+  return {
+    participants,
+    getLocalRoomAuth,
+    messages,
+    attachments,
+    taskLiveViews,
+    roomAppsEnabled,
+    sendRoomAppMessage,
+    subscribeRoomAppMessages,
+    sendRoomAppUnicast,
+    subscribeRoomAppUnicast,
+    subscribeRoomAppUnicastResults,
+    getRoomAppStats,
+    sendTextMessage,
+    sendFileMessage,
+    sendTaskAttachment,
+    sendActionMessage,
+    sendCollabRequest,
+    sendCollabResponse,
+    sendCollabResult,
+    sendPermissionResponse,
+    readRoomAttachment,
+    localParticipantId: sessionRef.current?.participantId,
+    muteSelf,
+    toggleScreenShare,
+    retryVerification,
+    error,
+    connectionStatus,
+    resolvedRoomType,
+    liveTranscript,
+    liveTranscriptSegments,
+    runtimeHosts,
+    runtimeHostProviders,
+    liveTranscriptMediaAvailable,
+    startLiveTranscript,
+    stopLiveTranscript,
+    leaveRoom,
+    agentVoice,
+    agentVoiceMediaAvailable,
+    agentActivities,
+    setAgentVoice,
+    createRuntimeProviderClaim,
+    connectLocalRuntime,
+    runtimeConnectionStatus,
+  }
+}
