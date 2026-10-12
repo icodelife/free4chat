@@ -3250,6 +3250,11 @@ export function useSfuChatRoom(
         kind: "human",
         turnstileToken,
       }
+      // 从 sessionStorage 取密码（首页输入的）
+      if (typeof sessionStorage !== "undefined") {
+        const pwd = sessionStorage.getItem("voice-chat-room-password")
+        if (pwd) body.password = pwd
+      }
       const reattach = readOrCreateRuntimeReattachSecret(roomName)
       if (reattach.existed && reattach.secret) {
         body.runtimeProviderReattachProofHash =
@@ -3272,10 +3277,19 @@ export function useSfuChatRoom(
         const data = (await response.json().catch(() => ({}))) as {
           error?: string
         }
+        // 密码相关错误的中文提示
+        const passwordErrorMap: Record<string, string> = {
+          password_not_allowed: "该服务器不支持密码房",
+          password_required: "该房间需要密码，请返回首页输入密码",
+          password_incorrect: "密码错误，请返回首页重试",
+          invalid_password: "密码长度需在 4-64 位之间",
+        }
         if (!reconnecting && response.status === 403) {
-          throw new TurnstileVerificationError(
-            data.error || "Verification failed"
-          )
+          const msg =
+            passwordErrorMap[data.error || ""] ||
+            data.error ||
+            "Verification failed"
+          throw new TurnstileVerificationError(msg)
         }
         throw new Error(data.error || "Unable to create SFU session")
       }

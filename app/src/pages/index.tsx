@@ -44,6 +44,7 @@ export default function Home() {
   const [roomName, setRoomName] = useState<string>("")
   const [nickName, setNickName] = useState<string>("")
   const [serverUrl, setServerUrl] = useState<string>(DEFAULT_SERVER)
+  const [password, setPassword] = useState<string>("")
 
   useEffect(() => {
     setRoomName(generateRoomName())
@@ -58,8 +59,13 @@ export default function Home() {
       if (typeof window !== "undefined") {
         saveRoomToLocalStorage(roomName, nickName)
         localStorage.setItem("voice-chat-server-url", serverUrl)
-        // 把服务器地址存到 session，供房间页使用
+        // 把服务器地址和密码存到 session，供房间页使用
         sessionStorage.setItem("voice-chat-server-url", serverUrl)
+        if (password) {
+          sessionStorage.setItem("voice-chat-room-password", password)
+        } else {
+          sessionStorage.removeItem("voice-chat-room-password")
+        }
       }
       router.push(`/room?id=${encodeURIComponent(roomName)}`)
     }
@@ -115,6 +121,25 @@ export default function Home() {
               />
             </span>
           </div>
+        </div>
+
+        <div className="mb-4">
+          <label className="mb-1 block text-sm text-gray-300">
+            房间密码 <span className="text-gray-500">（可选）</span>
+          </label>
+          <input
+            type="password"
+            className={inputClasses}
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="留空为公开房，填了就是密码房"
+            onKeyDown={(e) => {
+              if (e.key === "Enter") go()
+            }}
+          />
+          <p className="mt-1 text-xs text-gray-500">
+            建房时设置密码，他人进房需输入相同密码
+          </p>
         </div>
 
         <div className="mb-6">
