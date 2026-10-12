@@ -159,6 +159,6 @@ wrangler deploy
 ## 注意事项
 
 1. **联邦模式（默认）**：`DISABLE_ORIGIN_CHECK=true`（wrangler.jsonc 已默认开启），任何客户端可连任何服务端。如需收紧，设置 `ALLOWED_ORIGINS` 环境变量（逗号分隔的域名列表），或删除 `DISABLE_ORIGIN_CHECK`。
-2. **服务端限流**：每台服务端最多 5 个活跃房间（`ServerRegistry` DO 跟踪），每房间最多 10 人。超限时 `/api/sfu/session` 返回 429（`room_limit_reached` / `room_full`）。
+2. **房间限流**：每房间最多 10 人，`POST /api/sfu/session` 满员时返回 429（`room_full`）。
 3. **KV 可选**：`ROOMS_KV` 用于限流，未配置时自动跳过限流（已处理）。
 4. **房间自动清理**：DO 无人后自动休眠，状态不持久化；房间过期时自动从注册表移除。

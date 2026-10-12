@@ -5,7 +5,6 @@ import { handleSfuRequest } from "./src/sfu/server"
 import { handleRoomRequest, isRoomRequestPath } from "./src/room/server"
 
 export { RoomSession } from "./src/do/RoomSession"
-export { ServerRegistry } from "./src/do/ServerRegistry"
 
 export default {
   async fetch(request, env, ctx) {

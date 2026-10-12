@@ -277,8 +277,6 @@ export interface RoomSessionEnv {
   // collaboration analytics (direct Mixpanel /import). Absent in
   // local/test environments: analytics safely no-ops.
   MIXPANEL_PROJECT_TOKEN?: string
-  // 联邦模式：服务端房间注册表（单例 DO）
-  SERVER_REGISTRY?: DurableObjectNamespace
 }
 
 interface ConnectionAttachment {
@@ -1678,25 +1676,6 @@ export class RoomSession extends DurableObject<RoomSessionEnv> {
     // no storage backend assumption is needed here.
     await this.ctx.storage.deleteAlarm()
     await this.ctx.storage.deleteAll()
-    // 联邦模式：房间过期后从服务端注册表移除（best-effort）
-    try {
-      const registry = this.env.SERVER_REGISTRY
-      if (registry) {
-        const roomId = this.ctx.id.name ?? ""
-        if (roomId) {
-          const stub = registry.get(registry.idFromName("server-registry"))
-          await stub.fetch(
-            new Request(
-              `https://registry/?action=unregister&roomId=${encodeURIComponent(
-                roomId
-              )}`
-            )
-          )
-        }
-      }
-    } catch {
-      // 忽略，注册表同步失败不影响房间清理
-    }
     for (const waiter of expiringWaiters) {
       if (!waiter) continue
       waiter.resolve(
