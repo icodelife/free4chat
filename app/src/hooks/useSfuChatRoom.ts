@@ -1112,7 +1112,10 @@ export function useSfuChatRoom(
   const apiRequest = useCallback(async (path: string, body: object) => {
     const method =
       path === "renegotiate" || path.endsWith("/close") ? "PUT" : "POST"
-    const response = await fetch(`/api/sfu/${path}`, {
+    // 后端地址可配置：优先用环境变量，否则用当前域名（同源部署）
+    const baseUrl =
+      process.env.NEXT_PUBLIC_API_BASE_URL || window.location.origin
+    const response = await fetch(`${baseUrl}/api/sfu/${path}`, {
       method,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -2872,8 +2875,9 @@ export function useSfuChatRoom(
   const connectWebSocket = useCallback(() => {
     const session = sessionRef.current
     if (!session || closingRef.current) return
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:"
-    const url = new URL(`${protocol}//${window.location.host}/api/sfu/ws`)
+    const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || window.location.origin
+    const wsBase = baseUrl.replace(/^http/, "ws")
+    const url = new URL(`${wsBase}/api/sfu/ws`)
     url.searchParams.set("room", session.room)
     url.searchParams.set("participantId", session.participantId)
     url.searchParams.set("token", session.participantToken)
@@ -3250,7 +3254,9 @@ export function useSfuChatRoom(
           sessionId: previousSession.sessionId,
         }
       }
-      const response = await fetch("/api/sfu/session", {
+      const baseUrl =
+        process.env.NEXT_PUBLIC_API_BASE_URL || window.location.origin
+      const response = await fetch(`${baseUrl}/api/sfu/session`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
