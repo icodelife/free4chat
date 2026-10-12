@@ -64,9 +64,9 @@ jobs:
       - name: Set SFU Secret
         run: |
           if [ "${{ github.event.inputs.fresh_install }}" == "true" ]; then
-            echo "${{ steps.sfu.outputs.app_secret }}" | npx wrangler secret put SFU_APP_SECRET
+            printf '%s' '${{ steps.sfu.outputs.app_secret }}' | npx wrangler secret put SFU_APP_SECRET
           else
-            echo "${{ secrets.SFU_APP_SECRET }}" | npx wrangler secret put SFU_APP_SECRET
+            printf '%s' '${{ secrets.SFU_APP_SECRET }}' | npx wrangler secret put SFU_APP_SECRET
           fi
         working-directory: app
         env:
