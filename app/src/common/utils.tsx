@@ -69,65 +69,10 @@ export const strToRGB = (str: string) => {
   return "rgb(" + color[0] + "," + color[1] + "," + color[2] + ")"
 }
 
-export const gtagEvent = (action, category, label, value) => {
-  if (!Object.hasOwn(window, "gtag")) {
-    return
-  }
-  // @ts-ignore
-  window.gtag("event", action, {
-    event_category: category,
-    event_label: label,
-    value: value,
-  })
-}
-
-type AnalyticsProperties = Record<string, unknown>
-
-type AnalyticsWindow = Window & {
-  umami?: {
-    track: (eventName: string, eventData?: AnalyticsProperties) => void
-  }
-  zaraz?: {
-    track: (
-      eventName: string,
-      eventData?: AnalyticsProperties
-    ) => Promise<void> | void
-  }
-}
-
-const trackWithZaraz = (eventName: string, eventData: AnalyticsProperties) => {
-  const send = () => {
-    const zaraz = (window as AnalyticsWindow).zaraz
-    if (!zaraz) return false
-    try {
-      void Promise.resolve(zaraz.track(eventName, eventData)).catch(() => {})
-    } catch {
-      // Analytics must never block the product flow.
-    }
-    return true
-  }
-
-  if (!send()) window.setTimeout(send, 500)
-}
-
-export const trackAnalyticsEvent = (
-  eventName: string,
-  eventData: AnalyticsProperties = {}
-) => {
-  if (typeof window === "undefined") return
-
-  const umami = (window as AnalyticsWindow).umami
-  try {
-    umami?.track(eventName, eventData)
-  } catch {
-    // Analytics must never block the product flow.
-  }
-  trackWithZaraz(eventName, eventData)
-}
-
-// Keep existing instrumentation and its Umami reports working while forwarding
-// product events through the Cloudflare Zaraz Mixpanel tag.
-export const umamiEvent = trackAnalyticsEvent
+// 统计已移除：no-op 占位，保持调用方不报错
+export const gtagEvent = (..._args: any[]) => {}
+export const trackAnalyticsEvent = (..._args: any[]) => {}
+export const umamiEvent = (..._args: any[]) => {}
 
 export const hashRoom = (roomName: string): string => {
   let h = 0x811c9dc5

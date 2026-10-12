@@ -28,31 +28,6 @@ class MyDocument extends Document {
             href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
             rel="stylesheet"
           />
-          <script
-            async
-            defer
-            data-website-id="656d3289-e627-409c-a9d7-a272cf789f0b"
-            src="https://umami.bmpi.dev/script.js"
-          ></script>
-          {/* Global Site Tag (gtag.js) - Google Analytics */}
-          <script
-            async
-            src={`https://www.googletagmanager.com/gtag/js?id=G-J1JHM0XNR4`}
-          />
-          <script
-            dangerouslySetInnerHTML={{
-              __html: `
-            window.dataLayer = window.dataLayer || [];
-            function gtag(){dataLayer.push(arguments);}
-            gtag('js', new Date());
-            window.gtag = gtag;
-            gtag('config', 'G-J1JHM0XNR4', {
-              page_title: document.title,
-              page_path: window.location.pathname,
-            });
-          `,
-            }}
-          />
         </Head>
         <body>
           <Main />
