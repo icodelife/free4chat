@@ -4,7 +4,7 @@
 const MAX_ROOMS = 5
 
 interface RegistryState {
-  rooms: string[]  // 活跃房间 ID 列表
+  rooms: string[] // 活跃房间 ID 列表
 }
 
 export class ServerRegistry {
@@ -25,10 +25,15 @@ export class ServerRegistry {
       if (!roomId) {
         return Response.json({ error: "missing_roomId" }, { status: 400 })
       }
-      const state = (await this.state.storage.get<RegistryState>("state")) ?? { rooms: [] }
+      const state = (await this.state.storage.get<RegistryState>("state")) ?? {
+        rooms: [],
+      }
       if (!state.rooms.includes(roomId)) {
         if (state.rooms.length >= MAX_ROOMS) {
-          return Response.json({ error: "room_limit_reached", max: MAX_ROOMS }, { status: 429 })
+          return Response.json(
+            { error: "room_limit_reached", max: MAX_ROOMS },
+            { status: 429 }
+          )
         }
         state.rooms.push(roomId)
         await this.state.storage.put("state", state)
@@ -41,15 +46,23 @@ export class ServerRegistry {
       if (!roomId) {
         return Response.json({ error: "missing_roomId" }, { status: 400 })
       }
-      const state = (await this.state.storage.get<RegistryState>("state")) ?? { rooms: [] }
+      const state = (await this.state.storage.get<RegistryState>("state")) ?? {
+        rooms: [],
+      }
       state.rooms = state.rooms.filter((id) => id !== roomId)
       await this.state.storage.put("state", state)
       return Response.json({ ok: true, count: state.rooms.length })
     }
 
     if (action === "count") {
-      const state = (await this.state.storage.get<RegistryState>("state")) ?? { rooms: [] }
-      return Response.json({ count: state.rooms.length, max: MAX_ROOMS, rooms: state.rooms })
+      const state = (await this.state.storage.get<RegistryState>("state")) ?? {
+        rooms: [],
+      }
+      return Response.json({
+        count: state.rooms.length,
+        max: MAX_ROOMS,
+        rooms: state.rooms,
+      })
     }
 
     return Response.json({ error: "unknown_action" }, { status: 400 })

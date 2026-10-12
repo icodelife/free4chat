@@ -105,7 +105,11 @@ function originAllowed(
 ): boolean {
   const origin = request.headers.get("Origin")
   if (origin === null) return MISSING_ORIGIN_ALLOWED_ROUTES.has(route)
-  return isAllowedOrigin(origin, env?.ALLOWED_ORIGINS, env?.DISABLE_ORIGIN_CHECK)
+  return isAllowedOrigin(
+    origin,
+    env?.ALLOWED_ORIGINS,
+    env?.DISABLE_ORIGIN_CHECK
+  )
 }
 
 function getAppCredentials(
@@ -539,8 +543,15 @@ export async function handleSfuRequest(
           ? info.participants.length
           : 0
         // 房间已存在且满员 → 拒绝
-        if (info.exists && participantCount >= MAX_PARTICIPANTS_PER_ROOM && !isReconnect) {
-          return json({ error: "room_full", max: MAX_PARTICIPANTS_PER_ROOM }, 429)
+        if (
+          info.exists &&
+          participantCount >= MAX_PARTICIPANTS_PER_ROOM &&
+          !isReconnect
+        ) {
+          return json(
+            { error: "room_full", max: MAX_PARTICIPANTS_PER_ROOM },
+            429
+          )
         }
         // 房间不存在（新房间）→ 检查服务端房间数
         if (!info.exists && !isReconnect && env.SERVER_REGISTRY) {
@@ -548,10 +559,16 @@ export async function handleSfuRequest(
             env.SERVER_REGISTRY.idFromName("server-registry")
           )
           const regResp = await registryStub.fetch(
-            new Request(`https://registry/?action=register&roomId=${encodeURIComponent(room)}`)
+            new Request(
+              `https://registry/?action=register&roomId=${encodeURIComponent(
+                room
+              )}`
+            )
           )
           if (!regResp.ok) {
-            const regData = (await regResp.json().catch(() => ({}))) as { error?: string }
+            const regData = (await regResp.json().catch(() => ({}))) as {
+              error?: string
+            }
             if (regData.error === "room_limit_reached") {
               return json({ error: "room_limit_reached", max: 5 }, 429)
             }

@@ -1686,7 +1686,11 @@ export class RoomSession extends DurableObject<RoomSessionEnv> {
         if (roomId) {
           const stub = registry.get(registry.idFromName("server-registry"))
           await stub.fetch(
-            new Request(`https://registry/?action=unregister&roomId=${encodeURIComponent(roomId)}`)
+            new Request(
+              `https://registry/?action=unregister&roomId=${encodeURIComponent(
+                roomId
+              )}`
+            )
           )
         }
       }
