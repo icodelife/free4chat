@@ -40,7 +40,14 @@ export interface Message {
   taskRequestId?: string
 }
 
-export type ActionType = "whiteboard" | "poll" | "vote" | "game" | "reaction" | "collab" | "permission"
+export type ActionType =
+  | "whiteboard"
+  | "poll"
+  | "vote"
+  | "game"
+  | "reaction"
+  | "collab"
+  | "permission"
 
 export interface Color {
   r: string

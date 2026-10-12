@@ -13,8 +13,14 @@ export const decodeRoomAppEnvelope = (..._args: any[]) => null
 export const encodeRoomAppUnicastRequest = (..._args: any[]) => null
 export const encodeRoomAppEnvelope = (..._args: any[]) => null
 export const isRoomAppInstanceForRoom = (..._args: any[]) => false
-export const roomAppRateGuard = (..._args: any[]) => ({ ok: true, allow: (..._a: any[]) => true })
-export const roomAppUnicastRateGuard = (..._args: any[]) => ({ ok: true, allow: (..._a: any[]) => true })
+export const roomAppRateGuard = (..._args: any[]) => ({
+  ok: true,
+  allow: (..._a: any[]) => true,
+})
+export const roomAppUnicastRateGuard = (..._args: any[]) => ({
+  ok: true,
+  allow: (..._a: any[]) => true,
+})
 export type RoomAppLane = any
 export type RoomAppUnicastEnvelope = any
 export type RoomAppUnicastResult = any

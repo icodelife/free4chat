@@ -4,16 +4,9 @@ import { useRouter } from "next/router"
 
 import { LOCAL_PEER_ID } from "@common/consts"
 
+import RoomAppHost from "./RoomAppHost"
 import TextChatCard from "./TextChatCard"
 import UserCard from "./UserCard"
-import type { UserInfo } from "../common/types"
-import {
-  umamiEvent,
-  trackAnalyticsEvent,
-  hashRoom,
-  participantsBucket,
-} from "../common/utils"
-import { useSfuChatRoom } from "../hooks/useSfuChatRoom"
 import {
   buildRoomInviteUrl,
   experimentalRoomAppCatalog,
@@ -32,7 +25,14 @@ import {
   type TaskProjection,
 } from "../common/taskViews"
 import { MAX_COLLAB_SUMMARY_LENGTH } from "../common/taskViews"
-import RoomAppHost from "./RoomAppHost"
+import type { UserInfo } from "../common/types"
+import {
+  umamiEvent,
+  trackAnalyticsEvent,
+  hashRoom,
+  participantsBucket,
+} from "../common/utils"
+import { useSfuChatRoom } from "../hooks/useSfuChatRoom"
 import { useTurnstile } from "../hooks/useTurnstile"
 
 const MAX_FILE_SIZE = 20 * 1024 * 1024
