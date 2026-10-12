@@ -26,8 +26,6 @@
 - Realtime SFU App：语音媒体传输
 - 环境变量：`SFU_APP_ID`、`SFU_APP_SECRET`、`DISABLE_ORIGIN_CHECK=true`
 
-**未使用**：KV、D1、R2、TURN（只用 STUN）
-
 ## 快速部署
 
 ### 方式一：一键脚本（推荐）
@@ -73,11 +71,9 @@ export CLOUDFLARE_ACCOUNT_ID="你的账号ID"
 - [REPLICATE.md](./REPLICATE.md) — 复刻部署详细说明
 - [DEPLOY.md](./DEPLOY.md) — 手动部署步骤
 
-## 致谢
+## 鸣谢
 
-本项目参考了以下开源项目：
-
-- [free4chat](https://github.com/xwfounder/free4chat) — WebRTC 语音聊天室实现
+本项目来源于 [free4chat](https://github.com/xwfounder/free4chat)，感谢原作者的开源贡献。
 
 ## License
 
