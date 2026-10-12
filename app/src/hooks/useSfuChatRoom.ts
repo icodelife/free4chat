@@ -42,15 +42,13 @@ import {
 } from "@common/utils"
 import { MAX_COLLAB_SUMMARY_LENGTH } from "@do/collab"
 
-import type {
-  LiveTranscriptSegment,
-  LiveTranscriptState,
-  AgentActivityProjection,
-  RoomAttachmentProjection,
-  RoomAttachmentRead,
-  RuntimeHostProjection,
-  RuntimeHostProviderPublicAssociation,
-} from "../room/types"
+type LiveTranscriptSegment = any
+type LiveTranscriptState = any
+type AgentActivityProjection = any
+type RoomAttachmentProjection = any
+type RoomAttachmentRead = any
+type RuntimeHostProjection = any
+type RuntimeHostProviderPublicAssociation = any
 import type {
   SfuAgentVoiceState,
   SfuMessage,
@@ -58,7 +56,7 @@ import type {
   SfuRoomState,
   SfuSessionResponse,
   SfuTrack,
-} from "../sfu/types"
+} from "./sfuTypes"
 
 type ConnectionStatus =
   | "verifying"
@@ -1114,7 +1112,9 @@ export function useSfuChatRoom(
       path === "renegotiate" || path.endsWith("/close") ? "PUT" : "POST"
     // 后端地址可配置：优先用环境变量，否则用当前域名（同源部署）
     const baseUrl =
-      process.env.NEXT_PUBLIC_API_BASE_URL || window.location.origin
+      sessionStorage.getItem("voice-chat-server-url") ||
+      process.env.NEXT_PUBLIC_API_BASE_URL ||
+      window.location.origin
     const response = await fetch(`${baseUrl}/api/sfu/${path}`, {
       method,
       headers: { "Content-Type": "application/json" },
@@ -2665,7 +2665,7 @@ export function useSfuChatRoom(
       if (
         localParticipantForProvider &&
         Object.values(state.runtimeHostProviders ?? {}).some(
-          (association) =>
+          (association: any) =>
             association.humanParticipantId === localParticipantForProvider
         )
       ) {
@@ -2875,7 +2875,10 @@ export function useSfuChatRoom(
   const connectWebSocket = useCallback(() => {
     const session = sessionRef.current
     if (!session || closingRef.current) return
-    const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || window.location.origin
+    const baseUrl =
+      sessionStorage.getItem("voice-chat-server-url") ||
+      process.env.NEXT_PUBLIC_API_BASE_URL ||
+      window.location.origin
     const wsBase = baseUrl.replace(/^http/, "ws")
     const url = new URL(`${wsBase}/api/sfu/ws`)
     url.searchParams.set("room", session.room)
@@ -3255,7 +3258,9 @@ export function useSfuChatRoom(
         }
       }
       const baseUrl =
-        process.env.NEXT_PUBLIC_API_BASE_URL || window.location.origin
+        sessionStorage.getItem("voice-chat-server-url") ||
+        process.env.NEXT_PUBLIC_API_BASE_URL ||
+        window.location.origin
       const response = await fetch(`${baseUrl}/api/sfu/session`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },

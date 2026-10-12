@@ -3,11 +3,17 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from "react"
 import { useRouter } from "next/router"
 
 import { LOCAL_PEER_ID } from "@common/consts"
-import { MAX_COLLAB_SUMMARY_LENGTH } from "@do/collab"
 
-import RoomAppHost from "./RoomAppHost"
 import TextChatCard from "./TextChatCard"
 import UserCard from "./UserCard"
+import type { UserInfo } from "../common/types"
+import {
+  umamiEvent,
+  trackAnalyticsEvent,
+  hashRoom,
+  participantsBucket,
+} from "../common/utils"
+import { useSfuChatRoom } from "../hooks/useSfuChatRoom"
 import {
   buildRoomInviteUrl,
   experimentalRoomAppCatalog,
@@ -25,14 +31,8 @@ import {
   taskHasConnectedAgent,
   type TaskProjection,
 } from "../common/taskViews"
-import type { UserInfo } from "../common/types"
-import {
-  umamiEvent,
-  trackAnalyticsEvent,
-  hashRoom,
-  participantsBucket,
-} from "../common/utils"
-import { useSfuChatRoom } from "../hooks/useSfuChatRoom"
+import { MAX_COLLAB_SUMMARY_LENGTH } from "../common/taskViews"
+import RoomAppHost from "./RoomAppHost"
 import { useTurnstile } from "../hooks/useTurnstile"
 
 const MAX_FILE_SIZE = 20 * 1024 * 1024

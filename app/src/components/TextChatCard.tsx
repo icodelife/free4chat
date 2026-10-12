@@ -6,6 +6,7 @@ import React, {
   useCallback,
   memo,
 } from "react"
+import CollabArtifactViewer from "./CollabArtifactViewer"
 
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
@@ -13,9 +14,8 @@ import remarkGfm from "remark-gfm"
 import { LOCAL_PEER_ID } from "@common/consts"
 import { ActionType, Message } from "@common/types"
 import { strToBgColor, umamiEvent, hashRoom } from "@common/utils"
-import { MAX_COLLAB_SUMMARY_LENGTH } from "@do/collab"
+import { MAX_COLLAB_SUMMARY_LENGTH } from "../common/taskViews"
 
-import CollabArtifactViewer from "./CollabArtifactViewer"
 import {
   buildCollabLifecycleIndex,
   type CollabLifecycleProjection,
@@ -27,11 +27,9 @@ import {
   resolveSelectedAgentTargetIds,
 } from "../common/agentMentions"
 import type { UserInfo } from "../common/types"
-import type {
-  PermissionEvent,
-  RoomAttachmentProjection,
-  RoomAttachmentRead,
-} from "../room/types"
+type PermissionEvent = any
+type RoomAttachmentProjection = any
+type RoomAttachmentRead = any
 
 interface PendingFile {
   id: string
@@ -564,7 +562,7 @@ function PermissionCard({
                 key={key}
                 className="mt-0.5 break-all text-[11px] text-white/50"
               >
-                {key}: {value}
+                {String(key)}: {String(value)}
               </p>
             ))}
       </div>
@@ -714,7 +712,7 @@ function ActionCard({
                 key={key}
                 className="mt-0.5 break-all text-[11px] text-white/50"
               >
-                {key}: {value}
+                {String(key)}: {String(value)}
               </p>
             ))}
         {(collab.attachmentIds ?? []).length > 0 && onViewArtifact && (

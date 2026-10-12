@@ -1,42 +1,22 @@
-import type {
-  AgentActivityState,
-  CollabEvent,
-  PermissionEvent,
-  RoomSurfaceV1,
-} from "../room/types"
-
 export interface UserInfo {
   name: string
   kind: "human" | "agent"
   room: string
   className?: string
   audioStream?: MediaStream | null
-  screenShareStream?: MediaStream | null
-  screenShareEnabled?: boolean
   peerId: string
   muteState?: boolean | false
-  capabilities?: string[]
-  surface?: RoomSurfaceV1
-  // #176 Phase A: the Room-scoped Runtime Host id behind this Agent (agents
-  // only). Readiness itself travels once per host in Room state.
-  runtimeHostId?: string
-  // Derived client-side from one Runtime Host TTS projection plus the Room's
-  // participant-specific agentVoice authorization. Never persisted here.
+  screenShareEnabled?: boolean
+  screenShareStream?: MediaStream | null
   voiceAvailable?: boolean
   voiceEnabled?: boolean
-  activity?: AgentActivityState
+  activity?: any
+  capabilities?: string[]
+  surface?: any
+  runtimeHostId?: string
 }
 
 export type MessageType = "text" | "image" | "file" | "action"
-
-export type ActionType =
-  | "whiteboard"
-  | "poll"
-  | "vote"
-  | "game"
-  | "reaction"
-  | "collab"
-  | "permission"
 
 export interface Message {
   peerId: string
@@ -46,25 +26,21 @@ export interface Message {
   messageId?: string
   createdAt?: number
   sequence?: number
-  // Browser-local causal anchor for an ephemeral file message. It means the
-  // sender had observed Room messages through this sequence when the file
-  // transfer started; it is not a Room sequence and is never server-issued.
   afterSequence?: number
   ephemeral?: boolean
   text?: string
   fileLink?: string
   fileName?: string
   fileSize?: number
-  actionType?: ActionType
+  actionType?: string
   actionPayload?: Record<string, string>
-  collab?: CollabEvent
-  permission?: PermissionEvent
-  taskRequestId?: string
-  // #165: structured addressing targets (participant IDs) the sender
-  // explicitly chose. Pure routing metadata for the recipient cue — the
-  // canonical source of truth for wakeup, never a capability grant.
+  collab?: any
+  permission?: any
   targets?: string[]
+  taskRequestId?: string
 }
+
+export type ActionType = "whiteboard" | "poll" | "vote" | "game" | "reaction" | "collab" | "permission"
 
 export interface Color {
   r: string
