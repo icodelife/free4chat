@@ -3283,6 +3283,8 @@ export function useSfuChatRoom(
           password_required: "该房间需要密码，请返回首页输入密码",
           password_incorrect: "密码错误，请返回首页重试",
           invalid_password: "密码长度需在 4-64 位之间",
+          room_limit_reached: "服务器房间数已满，请稍后再试",
+          room_full: "房间人数已满（最多 10 人）",
         }
         if (!reconnecting && response.status === 403) {
           const msg =

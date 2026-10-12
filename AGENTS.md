@@ -45,6 +45,7 @@ free4chat/
 ### 房间限流
 
 `POST /api/sfu/session` 时检查：
+- 每服务端最多 5 个活跃房间（`MAX_ROOMS_PER_SERVER`，默认 5，设为 `0` 不限制），超限返回 `429 {"error":"room_limit_reached"}`
 - 每房间最多 10 人，满员返回 `429 {"error":"room_full"}`
 
 ### 房间生命周期
