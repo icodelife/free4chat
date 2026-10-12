@@ -1,5 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 
+// 默认后端服务器（与首页一致）
+const DEFAULT_SERVER =
+  process.env.NEXT_PUBLIC_API_BASE_URL ||
+  "https://voice-chat-server.cheng-0b4.workers.dev"
+
+// 获取后端地址：优先用户选择的，其次环境变量，最后默认
+const getServerUrl = () =>
+  (typeof sessionStorage !== "undefined" &&
+    sessionStorage.getItem("voice-chat-server-url")) ||
+  DEFAULT_SERVER
+
 import { LOCAL_PEER_ID } from "@common/consts"
 import {
   mergeRoomAndEphemeralMessages,
@@ -1111,10 +1122,7 @@ export function useSfuChatRoom(
     const method =
       path === "renegotiate" || path.endsWith("/close") ? "PUT" : "POST"
     // 后端地址可配置：优先用环境变量，否则用当前域名（同源部署）
-    const baseUrl =
-      sessionStorage.getItem("voice-chat-server-url") ||
-      process.env.NEXT_PUBLIC_API_BASE_URL ||
-      window.location.origin
+    const baseUrl = getServerUrl()
     const response = await fetch(`${baseUrl}/api/sfu/${path}`, {
       method,
       headers: { "Content-Type": "application/json" },
@@ -2875,10 +2883,7 @@ export function useSfuChatRoom(
   const connectWebSocket = useCallback(() => {
     const session = sessionRef.current
     if (!session || closingRef.current) return
-    const baseUrl =
-      sessionStorage.getItem("voice-chat-server-url") ||
-      process.env.NEXT_PUBLIC_API_BASE_URL ||
-      window.location.origin
+    const baseUrl = getServerUrl()
     const wsBase = baseUrl.replace(/^http/, "ws")
     const url = new URL(`${wsBase}/api/sfu/ws`)
     url.searchParams.set("room", session.room)
@@ -3257,10 +3262,7 @@ export function useSfuChatRoom(
           sessionId: previousSession.sessionId,
         }
       }
-      const baseUrl =
-        sessionStorage.getItem("voice-chat-server-url") ||
-        process.env.NEXT_PUBLIC_API_BASE_URL ||
-        window.location.origin
+      const baseUrl = getServerUrl()
       const response = await fetch(`${baseUrl}/api/sfu/session`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
