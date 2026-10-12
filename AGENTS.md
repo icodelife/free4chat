@@ -1,11 +1,10 @@
-# free4chat 中文精简版 — 开发指南
+# 语音聊天室 — 开发指南
 
 ## 项目概述
 
-基于 [free4chat](https://github.com/xwfounder/free4chat) 的 fork，精简为纯语音+文字聊天室。
+基于 Cloudflare 免费资源构建的语音+文字聊天室服务端。
 
-**保留**：语音聊天（WebRTC + Cloudflare Realtime SFU）、文字聊天、URL 房间（`/room?id=xxx`）
-**移除**：Agent、MCP、实时转写、TTS、文件/投票 UI 入口（底层代码保留但隐藏）
+**功能**：语音聊天（WebRTC + Cloudflare Realtime SFU）、文字聊天、URL 房间（`/room?id=xxx`）
 
 - 技术栈：Next.js 15 → Cloudflare Worker（`@opennextjs/cloudflare`）
 - 语音：浏览器 WebRTC → Cloudflare Realtime SFU
@@ -81,7 +80,6 @@ npx wrangler deploy --var "SFU_APP_ID:$SFU_APP_ID"
 
 ## 重要约束
 
-- 不要重新引入 Agent/MCP/转写/TTS 相关代码
 - `SFU_APP_SECRET` 是 Worker Secret，绝不提交到代码或发送给浏览器
 - 保持 `DISABLE_ORIGIN_CHECK=true` 默认开启（联邦模式）
 - 不要添加 R2 或服务端文件持久化

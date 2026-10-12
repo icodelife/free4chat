@@ -1,6 +1,6 @@
-# free4chat 中文精简版
+# 语音聊天室
 
-基于 [free4chat](https://github.com/xwfounder/free4chat) 的 fork，专为中文用户精简：**只保留语音聊天和文字聊天**，移除 Agent、MCP、实时转写、TTS 等高级功能。
+基于 Cloudflare 免费资源构建的语音+文字聊天室服务端，开箱即用。
 
 ## 特性
 
@@ -9,7 +9,7 @@
 - 🔗 **URL 房间**：分享链接 `/room?id=xxx` 即可进房，无需注册
 - 🌐 **联邦模式**：默认放开 Origin 限制，任何客户端可连接任何服务端
 - 🚦 **房间限流**：每房间最多 10 人，满员时返回 429
-- 🇨🇳 **中文界面**：全部 UI 已汉化
+- 🇨🇳 **中文界面**：全中文 UI
 
 ## 架构
 
@@ -73,16 +73,12 @@ export CLOUDFLARE_ACCOUNT_ID="你的账号ID"
 - [REPLICATE.md](./REPLICATE.md) — 复刻部署详细说明
 - [DEPLOY.md](./DEPLOY.md) — 手动部署步骤
 
-## 与官方版的区别
+## 致谢
 
-| | 官方版 | 本 fork |
-|---|---|---|
-| 语音+文字 | ✅ | ✅ |
-| Agent/MCP/转写/TTS | ✅ | ❌ 已移除 |
-| Origin 白名单 | 仅 free4.chat | 默认放开（联邦模式） |
-| 房间人数限制 | 无 | 10 人/房 |
-| 界面语言 | 英文 | 中文 |
+本项目参考了以下开源项目：
+
+- [free4chat](https://github.com/xwfounder/free4chat) — WebRTC 语音聊天室实现
 
 ## License
 
-MIT（继承上游）
+MIT
