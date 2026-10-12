@@ -17,6 +17,7 @@ interface RoomListItem {
   room: string
   participants: number
   hasPassword: boolean
+  title: string | null
   lastActiveAt: number
 }
 
@@ -52,6 +53,7 @@ export default function Home() {
   const [nickName, setNickName] = useState<string>("")
   const [serverUrl, setServerUrl] = useState<string>(DEFAULT_SERVER)
   const [password, setPassword] = useState<string>("")
+  const [roomTitle, setRoomTitle] = useState<string>("")
   const [rooms, setRooms] = useState<RoomListItem[]>([])
   const [roomsLoaded, setRoomsLoaded] = useState(false)
   const passwordRef = useRef<HTMLInputElement>(null)
@@ -102,12 +104,17 @@ export default function Home() {
       if (typeof window !== "undefined") {
         saveRoomToLocalStorage(rn, nickName)
         localStorage.setItem("voice-chat-server-url", serverUrl)
-        // 把服务器地址和密码存到 session，供房间页使用
+        // 把服务器地址、密码和房间名称存到 session，供房间页使用
         sessionStorage.setItem("voice-chat-server-url", serverUrl)
         if (pw) {
           sessionStorage.setItem("voice-chat-room-password", pw)
         } else {
           sessionStorage.removeItem("voice-chat-room-password")
+        }
+        if (roomTitle.trim()) {
+          sessionStorage.setItem("voice-chat-room-title", roomTitle.trim())
+        } else {
+          sessionStorage.removeItem("voice-chat-room-title")
         }
       }
       router.push(`/room?id=${encodeURIComponent(rn)}`)
@@ -118,6 +125,7 @@ export default function Home() {
   const joinFromList = (r: RoomListItem) => {
     setRoomName(r.room)
     setPassword("")
+    setRoomTitle("")
     if (r.hasPassword) {
       passwordRef.current?.focus()
       passwordRef.current?.scrollIntoView({
@@ -179,6 +187,22 @@ export default function Home() {
               />
             </span>
           </div>
+        </div>
+
+        <div className="mb-4">
+          <label className="mb-1 block text-sm text-gray-300">
+            房间名称 <span className="text-gray-500">（可选）</span>
+          </label>
+          <input
+            className={inputClasses}
+            value={roomTitle}
+            onChange={(e) => setRoomTitle(e.target.value)}
+            placeholder="比如：深夜树洞、游戏开黑"
+            maxLength={30}
+          />
+          <p className="mt-1 text-xs text-gray-500">
+            建房时设置，显示在房间列表里；不填则显示房间号
+          </p>
         </div>
 
         <div className="mb-4">
@@ -250,7 +274,7 @@ export default function Home() {
                   >
                     <span className="truncate text-sm text-white">
                       {r.hasPassword ? "🔒 " : ""}
-                      {r.room}
+                      {r.title || r.room}
                     </span>
                     <span className="ml-2 shrink-0 text-xs text-gray-500">
                       {r.participants} 人在线

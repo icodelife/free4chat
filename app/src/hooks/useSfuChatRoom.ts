@@ -3254,6 +3254,9 @@ export function useSfuChatRoom(
       if (typeof sessionStorage !== "undefined") {
         const pwd = sessionStorage.getItem("voice-chat-room-password")
         if (pwd) body.password = pwd
+        // 房间显示名（首页输入的，仅建房时有效）
+        const title = sessionStorage.getItem("voice-chat-room-title")
+        if (title) body.title = title
       }
       const reattach = readOrCreateRuntimeReattachSecret(roomName)
       if (reattach.existed && reattach.secret) {
