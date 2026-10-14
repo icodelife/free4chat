@@ -564,6 +564,8 @@ export function useSfuChatRoom(
     SfuRoomState["taskLiveViews"]
   >({})
   const [error, setError] = useState("")
+  // 麦克风是否可用；获取失败时降级为纯文字模式，不阻止进房
+  const [micAvailable, setMicAvailable] = useState(true)
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("verifying")
   const [roomAppsEnabled, setRoomAppsEnabled] = useState(false)
@@ -3228,17 +3230,29 @@ export function useSfuChatRoom(
 
       let audioTrack = localAudioTrackRef.current
       if (!audioTrack) {
-        const media = await navigator.mediaDevices.getUserMedia({
-          audio: true,
-          video: false,
-        })
-        audioTrack = media.getAudioTracks()[0] ?? null
-        if (!audioTrack) throw new Error("No microphone track available")
-        localAudioTrackRef.current = audioTrack
+        try {
+          const media = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+            video: false,
+          })
+          audioTrack = media.getAudioTracks()[0] ?? null
+          if (audioTrack) {
+            localAudioTrackRef.current = audioTrack
+          }
+        } catch {
+          // 麦克风不可用（权限拒绝/无设备/被占用）：不抛错，
+          // 降级为纯文字模式继续进房
+          audioTrack = null
+        }
+        if (!audioTrack) {
+          setMicAvailable(false)
+        }
       }
 
       const pc = createPeerConnection()
-      addLocalMediaTrack(pc, audioTrack, new MediaStream([audioTrack]))
+      if (audioTrack) {
+        addLocalMediaTrack(pc, audioTrack, new MediaStream([audioTrack]))
+      }
       const screenTrack = localScreenTrackRef.current
       if (screenTrack && screenTrack.readyState === "live")
         addLocalMediaTrack(pc, screenTrack, new MediaStream([screenTrack]))
@@ -3304,7 +3318,14 @@ export function useSfuChatRoom(
       roomAppsEnabledRef.current = false
       setRoomAppsEnabled(false)
       await establishDataChannelTransport()
-      await publishTrack(audioTrack, "audio", `audio-${session.participantId}`)
+      // 有麦克风才发布音频；无麦克风时只订阅他人音频+文字，不发布
+      if (audioTrack) {
+        await publishTrack(
+          audioTrack,
+          "audio",
+          `audio-${session.participantId}`
+        )
+      }
       if (screenTrack && screenTrack.readyState === "live") {
         await publishTrack(
           screenTrack,
@@ -3382,20 +3403,9 @@ export function useSfuChatRoom(
           setConnectionStatus("verification_failed")
           return
         }
-        // 麦克风权限/设备错误给中文友好提示，而不是浏览器的英文原文
-        let message =
+        setError(
           err instanceof Error ? err.message : "Unable to connect to SFU"
-        if (err instanceof DOMException) {
-          if (err.name === "NotAllowedError") {
-            message =
-              "麦克风权限被拒绝，请在浏览器地址栏左侧的权限设置中允许使用麦克风，然后刷新重试"
-          } else if (err.name === "NotFoundError") {
-            message = "未找到可用的麦克风设备"
-          } else if (err.name === "NotReadableError") {
-            message = "麦克风被其他应用占用，请关闭占用后重试"
-          }
-        }
-        setError(message)
+        )
         setConnectionStatus("failed")
       }
     }
@@ -4156,6 +4166,7 @@ export function useSfuChatRoom(
     readRoomAttachment,
     localParticipantId: sessionRef.current?.participantId,
     muteSelf,
+    micAvailable,
     toggleScreenShare,
     retryVerification,
     error,

@@ -208,7 +208,7 @@ function UserCard(user: UserCardProps) {
                 )}
               </div>
             )}
-          {isSelf && (
+          {isSelf && user.onMuteSelf && (
             <div className="mt-1 flex gap-1">
               <button
                 type="button"
@@ -284,7 +284,7 @@ function UserCard(user: UserCardProps) {
                 </svg>
               </span>
             )}
-            {isSelf && (
+            {isSelf && user.onMuteSelf && (
               <button
                 type="button"
                 className="participant-card__self-action absolute -bottom-1 -left-1 rounded-full bg-gray-900 p-0.5 opacity-70 transition-opacity hover:opacity-100"

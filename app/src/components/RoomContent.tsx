@@ -185,6 +185,7 @@ export default function RoomContent({
     sendCollabResult,
     sendPermissionResponse,
     muteSelf,
+    micAvailable,
     toggleScreenShare,
     retryVerification,
     error,
@@ -999,6 +1000,15 @@ export default function RoomContent({
         </div>
       </header>
 
+      {!micAvailable && connectionStatus === "connected" && (
+        <div className="flex-none border-b border-gray-800 bg-gray-950 px-4 py-2">
+          <p className="text-xs text-gray-400">
+            🎙️
+            未检测到麦克风，当前为纯文字模式（可正常收听他人语音、发送文字消息）
+          </p>
+        </div>
+      )}
+
       {error !== "" && (
         <div
           className={`${
@@ -1268,7 +1278,7 @@ export default function RoomContent({
                           audioStream={p.audioStream}
                           screenShareStream={p.screenShareStream}
                           screenShareEnabled={p.screenShareEnabled}
-                          onMuteSelf={muteSelf}
+                          onMuteSelf={micAvailable ? muteSelf : undefined}
                           onToggleScreenShare={wrappedToggleScreenShare}
                           screenshareAllowed={screenshareAllowed}
                           voiceAvailable={
@@ -1303,7 +1313,7 @@ export default function RoomContent({
                         audioStream={p.audioStream}
                         screenShareStream={p.screenShareStream}
                         screenShareEnabled={p.screenShareEnabled}
-                        onMuteSelf={muteSelf}
+                        onMuteSelf={micAvailable ? muteSelf : undefined}
                         onToggleScreenShare={wrappedToggleScreenShare}
                         voiceAvailable={
                           p.voiceAvailable && agentVoiceMediaAvailable
