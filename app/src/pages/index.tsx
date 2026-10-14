@@ -4,7 +4,8 @@ import { useRouter } from "next/router"
 
 import {
   generateParticipantName,
-  generateRoomName,
+  generateRoomTitle,
+  generateRoomId,
 } from "../common/cosmicNames"
 import { saveRoomToLocalStorage } from "../common/utils"
 
@@ -57,18 +58,29 @@ const DiceButton = ({
 
 export default function Home() {
   const router = useRouter()
-  const [roomName, setRoomName] = useState<string>("")
+  // 房间 ID：后台随机生成，不展示给用户
+  const [roomId] = useState<string>(() => generateRoomId())
   const [nickName, setNickName] = useState<string>("")
   const [serverUrl, setServerUrl] = useState<string>(DEFAULT_SERVER)
   const [password, setPassword] = useState<string>("")
   const [roomTitle, setRoomTitle] = useState<string>("")
   const [rooms, setRooms] = useState<RoomListItem[]>([])
   const [roomsLoaded, setRoomsLoaded] = useState(false)
-  const passwordRef = useRef<HTMLInputElement>(null)
+  // 正在输密码的房间（点 🔒 卡片后展开）
+  const [pwRoom, setPwRoom] = useState<RoomListItem | null>(null)
+  const [pwValue, setPwValue] = useState<string>("")
+  const [nickHint, setNickHint] = useState(false)
+  const [copied, setCopied] = useState(false)
+  // 房间名是否自动生成（用户手动改过就不再自动覆盖）
+  const titleAuto = useRef(true)
+  const nickRef = useRef<HTMLInputElement>(null)
+  const pwRef = useRef<HTMLInputElement>(null)
+
+  const usedNames = () => rooms.map((r) => ({ name: r.title || r.room }))
 
   useEffect(() => {
-    setRoomName(generateRoomName())
     setNickName(generateParticipantName())
+    setRoomTitle(generateRoomTitle([]))
     // 从 localStorage 恢复上次用的服务器
     const saved = localStorage.getItem("voice-chat-server-url")
     if (saved) setServerUrl(saved)
@@ -92,7 +104,17 @@ export default function Home() {
           return
         }
         const data = (await resp.json()) as { rooms?: RoomListItem[] }
-        setRooms(Array.isArray(data.rooms) ? data.rooms : [])
+        const list = Array.isArray(data.rooms) ? data.rooms : []
+        setRooms(list)
+        // 房间名是自动生成的且重名了，换一个
+        if (titleAuto.current) {
+          setRoomTitle((cur) => {
+            const taken = new Set(list.map((r) => r.title || r.room))
+            return taken.has(cur)
+              ? generateRoomTitle(list.map((r) => ({ name: r.title || r.room })))
+              : cur
+          })
+        }
       } catch {
         setRooms([])
       }
@@ -105,44 +127,63 @@ export default function Home() {
     }
   }, [serverUrl])
 
-  const go = (targetRoom?: string, targetPassword?: string) => {
-    const rn = targetRoom ?? roomName
-    const pw = targetPassword ?? password
-    if (rn !== "" && nickName !== "") {
-      if (typeof window !== "undefined") {
-        saveRoomToLocalStorage(rn, nickName)
-        localStorage.setItem("voice-chat-server-url", serverUrl)
-        // 把服务器地址、密码和房间名称存到 session，供房间页使用
-        sessionStorage.setItem("voice-chat-server-url", serverUrl)
-        if (pw) {
-          sessionStorage.setItem("voice-chat-room-password", pw)
-        } else {
-          sessionStorage.removeItem("voice-chat-room-password")
-        }
-        if (roomTitle.trim()) {
-          sessionStorage.setItem("voice-chat-room-title", roomTitle.trim())
-        } else {
-          sessionStorage.removeItem("voice-chat-room-title")
-        }
+  // 进房：rid 为房间 ID（对外不可见），title 只在建房时用
+  const enter = (rid: string, title: string, pw: string) => {
+    if (!nickName.trim()) {
+      setNickHint(true)
+      nickRef.current?.scrollIntoView({ behavior: "smooth", block: "center" })
+      nickRef.current?.focus()
+      return
+    }
+    if (typeof window !== "undefined") {
+      saveRoomToLocalStorage(rid, nickName)
+      localStorage.setItem("voice-chat-server-url", serverUrl)
+      // 把服务器地址、密码和房间名称存到 session，供房间页使用
+      sessionStorage.setItem("voice-chat-server-url", serverUrl)
+      if (pw) {
+        sessionStorage.setItem("voice-chat-room-password", pw)
+      } else {
+        sessionStorage.removeItem("voice-chat-room-password")
       }
-      router.push(`/room?id=${encodeURIComponent(rn)}`)
+      if (title.trim()) {
+        sessionStorage.setItem("voice-chat-room-title", title.trim())
+      } else {
+        sessionStorage.removeItem("voice-chat-room-title")
+      }
+    }
+    router.push(`/room?id=${encodeURIComponent(rid)}`)
+  }
+
+  // 创建新房间：标题为空则自动生成一个
+  const create = () => {
+    const title = roomTitle.trim() || generateRoomTitle(usedNames())
+    enter(roomId, title, password)
+  }
+
+  // 从列表点房间：公开房直接进，密码房展开密码输入
+  const joinFromList = (r: RoomListItem) => {
+    setPwValue("")
+    if (r.hasPassword) {
+      setPwRoom(r)
+      setTimeout(() => pwRef.current?.focus(), 50)
+    } else {
+      setPwRoom(null)
+      enter(r.room, "", "")
     }
   }
 
-  // 从列表点房间：公开房直接进，密码房填好房号后聚焦密码框
-  const joinFromList = (r: RoomListItem) => {
-    setRoomName(r.room)
-    setPassword("")
-    setRoomTitle("")
-    if (r.hasPassword) {
-      passwordRef.current?.focus()
-      passwordRef.current?.scrollIntoView({
-        behavior: "smooth",
-        block: "center",
-      })
-    } else {
-      go(r.room, "")
+  const copyLink = async () => {
+    const base = serverUrl.trim().replace(/\/+$/, "") || DEFAULT_SERVER
+    const link = `${base}/room?id=${encodeURIComponent(roomId)}`
+    try {
+      await navigator.clipboard.writeText(link)
+    } catch {
+      // 剪贴板不可用时降级为 prompt
+      window.prompt("复制分享链接：", link)
+      return
     }
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
   }
 
   const resetServer = () => setServerUrl(DEFAULT_SERVER)
@@ -154,139 +195,58 @@ export default function Home() {
           语音聊天室
         </h1>
         <p className="mb-6 text-center text-sm text-gray-400">
-          输入房间号和昵称，开始语音+文字聊天
+          填个昵称，加入房间或创建新房间
         </p>
 
-        <div className="mb-4">
-          <label className="mb-1 block text-sm text-gray-300">服务器</label>
-          <div className="flex gap-2">
-            <input
-              className={inputClasses}
-              value={serverUrl}
-              onChange={(e) => setServerUrl(e.target.value)}
-              placeholder="服务器地址"
-            />
-            <button
-              onClick={resetServer}
-              title="恢复默认服务器"
-              className="shrink-0 rounded-lg border border-gray-700 px-3 text-sm text-gray-400 transition hover:border-gray-500 hover:text-gray-200"
-            >
-              重置
-            </button>
-          </div>
-          <p className="mt-1 text-xs text-gray-500">
-            可填任意 voice-chat-server 地址，默认用官方服务器
-          </p>
-        </div>
-
-        <div className="mb-4">
-          <label className="mb-1 block text-sm text-gray-300">房间号</label>
-          <div className="relative">
-            <input
-              className={inputClasses}
-              value={roomName}
-              onChange={(e) => setRoomName(e.target.value)}
-              placeholder="房间号"
-            />
-            <span className="absolute inset-y-0 right-0 grid w-10 place-content-center">
-              <DiceButton
-                onClick={() => setRoomName(generateRoomName())}
-                title="随机房间号"
-              />
-            </span>
-          </div>
-        </div>
-
-        <div className="mb-4">
-          <label className="mb-1 block text-sm text-gray-300">
-            房间名称 <span className="text-gray-500">（可选）</span>
-          </label>
-          <input
-            className={inputClasses}
-            value={roomTitle}
-            onChange={(e) => setRoomTitle(e.target.value)}
-            placeholder="比如：深夜树洞、游戏开黑"
-            maxLength={30}
-          />
-          <p className="mt-1 text-xs text-gray-500">
-            建房时设置，显示在房间列表里；不填则显示房间号
-          </p>
-        </div>
-
-        <div className="mb-4">
-          <label className="mb-1 block text-sm text-gray-300">
-            房间密码 <span className="text-gray-500">（可选）</span>
-          </label>
-          <input
-            type="password"
-            ref={passwordRef}
-            className={inputClasses}
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="留空为公开房，填了就是密码房"
-            onKeyDown={(e) => {
-              if (e.key === "Enter") go()
-            }}
-          />
-          <p className="mt-1 text-xs text-gray-500">
-            建房时设置密码，他人进房需输入相同密码
-          </p>
-        </div>
-
+        {/* 昵称：两条路径共用 */}
         <div className="mb-6">
           <label className="mb-1 block text-sm text-gray-300">昵称</label>
           <div className="relative">
             <input
+              ref={nickRef}
               className={inputClasses}
               value={nickName}
-              onChange={(e) => setNickName(e.target.value)}
-              placeholder="你的昵称"
-              onKeyDown={(e) => {
-                if (e.key === "Enter") go()
+              onChange={(e) => {
+                setNickName(e.target.value)
+                setNickHint(false)
               }}
+              placeholder="你的昵称"
             />
             <span className="absolute inset-y-0 right-0 grid w-10 place-content-center">
               <DiceButton
-                onClick={() => setNickName(generateParticipantName())}
+                onClick={() => {
+                  setNickName(generateParticipantName())
+                  setNickHint(false)
+                }}
                 title="随机昵称"
               />
             </span>
           </div>
+          {nickHint && (
+            <p className="mt-1 text-xs text-red-400">请先填写昵称</p>
+          )}
         </div>
 
-        <button
-          onClick={() => go()}
-          className="w-full rounded-lg bg-blue-600 py-3 font-medium text-white transition hover:bg-blue-500"
-          style={{ boxShadow: "none" }}
-        >
-          进入房间
-        </button>
-
-        <p className="mt-4 text-center text-xs text-gray-500">
-          分享链接给朋友：{serverUrl}/room?id=房间号
-        </p>
-
-        {roomsLoaded && (
-          <div className="mt-6 border-t border-gray-800 pt-4">
-            <p className="mb-2 text-sm text-gray-300">
-              活跃房间 <span className="text-gray-500">（点击直接加入）</span>
-            </p>
-            {rooms.length > 0 ? (
-              <div className="max-h-48 space-y-2 overflow-y-auto">
+        {/* 加入房间 */}
+        <div className="mb-6">
+          <p className="mb-2 text-sm font-medium text-gray-200">加入房间</p>
+          {roomsLoaded && rooms.length > 0 ? (
+            <>
+              <div className="grid grid-cols-2 gap-2">
                 {rooms.map((r) => (
                   <button
                     key={r.room}
                     onClick={() => joinFromList(r)}
                     type="button"
-                    className="flex w-full items-center justify-between rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-left transition hover:border-gray-600"
+                    className="flex min-h-16 flex-col justify-center rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-left transition hover:border-gray-600"
                   >
                     <span className="truncate text-sm text-white">
                       {r.hasPassword ? "🔒 " : ""}
                       {r.title || r.room}
                     </span>
-                    <span className="ml-2 shrink-0 text-xs text-gray-500">
+                    <span className="mt-0.5 text-xs text-gray-500">
                       {r.participants > 0 ? (
-                        <>{r.participants} 人在线</>
+                        <>● {r.participants} 人在线</>
                       ) : (
                         <>{idleCountdown(r)}</>
                       )}
@@ -294,13 +254,141 @@ export default function Home() {
                   </button>
                 ))}
               </div>
-            ) : (
-              <p className="text-sm text-gray-500">
-                暂无活跃房间，快来创建第一个吧
-              </p>
-            )}
+              <p className="mt-1 text-xs text-gray-500">点击卡片直接加入</p>
+            </>
+          ) : roomsLoaded ? (
+            <p className="rounded-lg border border-dashed border-gray-800 px-3 py-4 text-center text-sm text-gray-500">
+              还没有活跃房间，在下面创建一个吧
+            </p>
+          ) : (
+            <p className="text-sm text-gray-500">房间列表加载中…</p>
+          )}
+
+          {/* 密码房：卡片内展开输入 */}
+          {pwRoom && (
+            <div className="mt-2 flex gap-2">
+              <input
+                ref={pwRef}
+                type="password"
+                className={inputClasses}
+                value={pwValue}
+                onChange={(e) => setPwValue(e.target.value)}
+                placeholder={`输入「${pwRoom.title || "房间"}」的密码`}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && pwValue) {
+                    enter(pwRoom.room, "", pwValue)
+                    setPwRoom(null)
+                  }
+                }}
+              />
+              <button
+                onClick={() => {
+                  if (pwValue) {
+                    enter(pwRoom.room, "", pwValue)
+                    setPwRoom(null)
+                  }
+                }}
+                className="shrink-0 rounded-lg bg-blue-600 px-4 text-sm font-medium text-white transition hover:bg-blue-500"
+              >
+                进入
+              </button>
+              <button
+                onClick={() => setPwRoom(null)}
+                className="shrink-0 rounded-lg border border-gray-700 px-3 text-sm text-gray-400 transition hover:text-gray-200"
+              >
+                取消
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* 创建新房间 */}
+        <div className="mb-6 border-t border-gray-800 pt-4">
+          <p className="mb-2 text-sm font-medium text-gray-200">创建新房间</p>
+          <div className="mb-3">
+            <label className="mb-1 block text-sm text-gray-300">房间名</label>
+            <div className="relative">
+              <input
+                className={inputClasses}
+                value={roomTitle}
+                onChange={(e) => {
+                  setRoomTitle(e.target.value)
+                  titleAuto.current = false
+                }}
+                placeholder="房间名"
+                maxLength={30}
+              />
+              <span className="absolute inset-y-0 right-0 grid w-10 place-content-center">
+                <DiceButton
+                  onClick={() => {
+                    setRoomTitle(generateRoomTitle(usedNames()))
+                    titleAuto.current = true
+                  }}
+                  title="随机房间名"
+                />
+              </span>
+            </div>
           </div>
-        )}
+          <div className="mb-4">
+            <label className="mb-1 block text-sm text-gray-300">
+              房间密码 <span className="text-gray-500">（可选）</span>
+            </label>
+            <input
+              type="password"
+              className={inputClasses}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="留空为公开房，填了就是密码房"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") create()
+              }}
+            />
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={create}
+              className="flex-1 rounded-lg bg-blue-600 py-3 font-medium text-white transition hover:bg-blue-500"
+              style={{ boxShadow: "none" }}
+            >
+              创建并进入
+            </button>
+            <button
+              onClick={copyLink}
+              title="复制分享链接"
+              className="shrink-0 rounded-lg border border-gray-700 px-4 text-sm text-gray-300 transition hover:border-gray-500 hover:text-white"
+            >
+              {copied ? "已复制 ✓" : "复制链接"}
+            </button>
+          </div>
+        </div>
+
+        {/* 高级设置 */}
+        <details className="text-sm text-gray-400">
+          <summary className="cursor-pointer select-none text-gray-500 hover:text-gray-300">
+            高级设置
+          </summary>
+          <div className="mt-2">
+            <label className="mb-1 block text-sm text-gray-300">服务器</label>
+            <div className="flex gap-2">
+              <input
+                className={inputClasses}
+                value={serverUrl}
+                onChange={(e) => setServerUrl(e.target.value)}
+                placeholder="服务器地址"
+              />
+              <button
+                onClick={resetServer}
+                title="恢复默认服务器"
+                className="shrink-0 rounded-lg border border-gray-700 px-3 text-sm text-gray-400 transition hover:border-gray-500 hover:text-gray-200"
+              >
+                重置
+              </button>
+            </div>
+            <p className="mt-1 text-xs text-gray-500">
+              可填任意 voice-chat-server 地址，默认用官方服务器
+            </p>
+          </div>
+        </details>
       </div>
     </div>
   )

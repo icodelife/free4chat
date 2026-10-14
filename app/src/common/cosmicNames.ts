@@ -281,3 +281,58 @@ export function generateParticipantName(
     `${pick(PLANET_STARTS, entropy)}${pick(PLANET_ENDINGS, entropy)}`
   )
 }
+
+// 中文房间名：两个中文词组合（主题 x 场所），避开已在使用的名称
+const ROOM_TITLE_THEMES = [
+  "星河",
+  "萤火",
+  "云间",
+  "月光",
+  "清风",
+  "晨曦",
+  "晚霞",
+  "竹影",
+  "松涛",
+  "听雨",
+  "山海",
+  "花间",
+]
+const ROOM_TITLE_PLACES = [
+  "小屋",
+  "茶馆",
+  "客厅",
+  "驿站",
+  "树屋",
+  "庭院",
+  "书房",
+  "花园",
+  "小筑",
+  "亭台",
+]
+
+export function generateRoomTitle(
+  rooms: { name: string }[] = [],
+  random: () => number = Math.random
+) {
+  const used = new Set(rooms.map((room) => room.name))
+  const all = ROOM_TITLE_THEMES.flatMap((theme) =>
+    ROOM_TITLE_PLACES.map((place) => theme + place)
+  )
+  const available = all.filter((title) => !used.has(title))
+  const choices = available.length ? available : all
+  return choices[
+    Math.min(choices.length - 1, Math.floor(random() * choices.length))
+  ]
+}
+
+// 房间 ID：后台随机字符串，不展示给用户
+const ROOM_ID_ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz"
+const ROOM_ID_LENGTH = 16
+
+export function generateRoomId(entropy: EntropySource = secureEntropy) {
+  let id = ""
+  for (let i = 0; i < ROOM_ID_LENGTH; i += 1) {
+    id += pick(ROOM_ID_ALPHABET.split(""), entropy)
+  }
+  return id
+}
