@@ -3382,9 +3382,20 @@ export function useSfuChatRoom(
           setConnectionStatus("verification_failed")
           return
         }
-        setError(
+        // 麦克风权限/设备错误给中文友好提示，而不是浏览器的英文原文
+        let message =
           err instanceof Error ? err.message : "Unable to connect to SFU"
-        )
+        if (err instanceof DOMException) {
+          if (err.name === "NotAllowedError") {
+            message =
+              "麦克风权限被拒绝，请在浏览器地址栏左侧的权限设置中允许使用麦克风，然后刷新重试"
+          } else if (err.name === "NotFoundError") {
+            message = "未找到可用的麦克风设备"
+          } else if (err.name === "NotReadableError") {
+            message = "麦克风被其他应用占用，请关闭占用后重试"
+          }
+        }
+        setError(message)
         setConnectionStatus("failed")
       }
     }
