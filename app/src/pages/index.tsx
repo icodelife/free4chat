@@ -18,7 +18,15 @@ interface RoomListItem {
   participants: number
   hasPassword: boolean
   title: string | null
+  expiresAt: number | null
   lastActiveAt: number
+}
+
+// 空闲房间距离销毁的分钟数（不足 1 分钟显示"即将"）
+function idleCountdown(r: RoomListItem): string {
+  if (r.participants > 0 || !r.expiresAt) return "空闲"
+  const mins = Math.max(0, Math.round((r.expiresAt - Date.now()) / 60000))
+  return mins <= 0 ? "空闲·即将清理" : `空闲·${mins}分钟后清理`
 }
 
 const inputClasses =
@@ -280,7 +288,7 @@ export default function Home() {
                       {r.participants > 0 ? (
                         <>{r.participants} 人在线</>
                       ) : (
-                        <>空闲</>
+                        <>{idleCountdown(r)}</>
                       )}
                     </span>
                   </button>
