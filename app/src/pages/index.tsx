@@ -71,6 +71,8 @@ export default function Home() {
   const [pwValue, setPwValue] = useState<string>("")
   const [nickHint, setNickHint] = useState(false)
   const [copied, setCopied] = useState(false)
+  // 服务端是否支持密码房（取不到时默认 true，保持现有行为）
+  const [passwordRooms, setPasswordRooms] = useState(true)
   // 房间名是否自动生成（用户手动改过就不再自动覆盖）
   const titleAuto = useRef(true)
   const nickRef = useRef<HTMLInputElement>(null)
@@ -85,6 +87,30 @@ export default function Home() {
     const saved = localStorage.getItem("voice-chat-server-url")
     if (saved) setServerUrl(saved)
   }, [])
+
+  // 拉取服务端能力（是否支持密码房等），服务器地址变化时刷新
+  useEffect(() => {
+    let cancelled = false
+    const fetchCaps = async () => {
+      const base = serverUrl.trim().replace(/\/+$/, "")
+      if (!base) return
+      try {
+        const resp = await fetch(`${base}/health`)
+        if (!resp.ok) return
+        const data = (await resp.json()) as {
+          capabilities?: { passwordRooms?: boolean }
+        }
+        const pr = data?.capabilities?.passwordRooms
+        if (!cancelled && typeof pr === "boolean") setPasswordRooms(pr)
+      } catch {
+        // 取不到就保持上次的值（默认显示密码框）
+      }
+    }
+    fetchCaps()
+    return () => {
+      cancelled = true
+    }
+  }, [serverUrl])
 
   // 拉取活跃房间列表（15 秒刷新一次）
   useEffect(() => {
@@ -156,10 +182,10 @@ export default function Home() {
     router.push(`/room?id=${encodeURIComponent(rid)}`)
   }
 
-  // 创建新房间：标题为空则自动生成一个
+  // 创建新房间：标题为空则自动生成一个；服务端不支持密码房时不传密码
   const create = () => {
     const title = roomTitle.trim() || generateRoomTitle(usedNames())
-    enter(roomId, title, password)
+    enter(roomId, title, passwordRooms ? password : "")
   }
 
   // 从列表点房间：公开房直接进，密码房展开密码输入
@@ -333,21 +359,23 @@ export default function Home() {
               </span>
             </div>
           </div>
-          <div className="mb-4">
-            <label className="mb-1 block text-sm text-gray-300">
-              房间密码 <span className="text-gray-500">（可选）</span>
-            </label>
-            <input
-              type="password"
-              className={inputClasses}
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="留空为公开房，填了就是密码房"
-              onKeyDown={(e) => {
-                if (e.key === "Enter") create()
-              }}
-            />
-          </div>
+          {passwordRooms && (
+            <div className="mb-4">
+              <label className="mb-1 block text-sm text-gray-300">
+                房间密码 <span className="text-gray-500">（可选）</span>
+              </label>
+              <input
+                type="password"
+                className={inputClasses}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="留空为公开房，填了就是密码房"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") create()
+                }}
+              />
+            </div>
+          )}
           <div className="flex gap-2">
             <button
               onClick={create}
