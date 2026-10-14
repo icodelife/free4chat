@@ -277,7 +277,11 @@ export default function Home() {
                       {r.title || r.room}
                     </span>
                     <span className="ml-2 shrink-0 text-xs text-gray-500">
-                      {r.participants} 人在线
+                      {r.participants > 0 ? (
+                        <>{r.participants} 人在线</>
+                      ) : (
+                        <>空闲</>
+                      )}
                     </span>
                   </button>
                 ))}
