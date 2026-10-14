@@ -175,8 +175,10 @@ export default function Home() {
   }
 
   const copyLink = async () => {
-    const base = serverUrl.trim().replace(/\/+$/, "") || DEFAULT_SERVER
-    const link = `${base}/room?id=${encodeURIComponent(roomId)}`
+    // 分享链接必须指向前端（当前站点），/room 是前端路由，后端没有这个页面
+    const link = `${window.location.origin}/room?id=${encodeURIComponent(
+      roomId
+    )}`
     try {
       await navigator.clipboard.writeText(link)
     } catch {
