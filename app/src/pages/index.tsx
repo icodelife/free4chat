@@ -111,7 +111,9 @@ export default function Home() {
           setRoomTitle((cur) => {
             const taken = new Set(list.map((r) => r.title || r.room))
             return taken.has(cur)
-              ? generateRoomTitle(list.map((r) => ({ name: r.title || r.room })))
+              ? generateRoomTitle(
+                  list.map((r) => ({ name: r.title || r.room }))
+                )
               : cur
           })
         }
